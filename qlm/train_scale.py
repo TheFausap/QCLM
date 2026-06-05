@@ -1,0 +1,188 @@
+"""Scale-up training for the Quantum Channel LM (DGX Spark target).
+
+Same QCLM as the CPU PoC, wired for a real corpus and GPU:
+  - byte-level BPE tokenizer (qlm/tokenizer.py)
+  - streaming FineWeb / FineWeb-Edu, packed into blocks (qlm/data_fineweb.py)
+  - device auto-select, gradient accumulation, truncated BPTT, cosine LR
+  - periodic held-out eval + samples + checkpointing
+
+The model arithmetic is complex64 (CUDA-capable). For peak Blackwell tensor-core
+throughput, implement complex matmuls as real 2x2 blocks in bf16 (see PLAN_2B.md);
+that is a drop-in kernel change, not an architecture change.
+
+Runs on CPU with a tiny config for a smoke test; scales up purely via flags.
+"""
+from __future__ import annotations
+import os, sys, time, json, math, argparse
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import torch
+from qlm.model import QuantumChannelLM
+from qlm.tokenizer import BPETokenizer
+from qlm.data_fineweb import make_stream, fineweb_doc_iter, local_doc_iter
+
+LN2 = math.log(2.0)
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def get_device(pref: str) -> torch.device:
+    if pref == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device(pref)
+
+
+def build_or_load_tokenizer(args) -> BPETokenizer:
+    if args.tokenizer and os.path.exists(args.tokenizer):
+        print("loading tokenizer:", args.tokenizer)
+        return BPETokenizer.load(args.tokenizer)
+    # train a fresh BPE on a slice of the corpus
+    print(f"training byte-level BPE (vocab={args.vocab}) on {args.bpe_train_docs} docs ...")
+    if args.source == "fineweb":
+        docs = fineweb_doc_iter(name=args.fineweb_name, dataset=args.fineweb_dataset)
+    else:
+        docs = local_doc_iter(args.local_path)
+
+    def limited(it, k):
+        for i, d in enumerate(it):
+            if i >= k:
+                break
+            yield d
+    tok = BPETokenizer.train(limited(docs, args.bpe_train_docs), vocab_size=args.vocab)
+    out = args.tokenizer or os.path.join(args.out, f"bpe_{args.vocab}.json")
+    tok.save(out)
+    print("saved tokenizer:", out)
+    return tok
+
+
+@torch.no_grad()
+def evaluate(model, eval_batches, device, tbptt):
+    model.eval()
+    tot_nll, tot_tok = 0.0, 0
+    for seqs in eval_batches:
+        out = model.forward(seqs.to(device), tbptt=tbptt)
+        tot_nll += out["nll_sum"].item(); tot_tok += out["n_tokens"]
+    model.train()
+    nll = tot_nll / max(tot_tok, 1)
+    return nll / LN2
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    # data / tokenizer
+    ap.add_argument("--source", choices=["fineweb", "local"], default="fineweb")
+    ap.add_argument("--fineweb_dataset", default="HuggingFaceFW/fineweb-edu")
+    ap.add_argument("--fineweb_name", default="sample-10BT")
+    ap.add_argument("--local_path", default=os.path.join(HERE, "data", "tinyshakespeare.txt"))
+    ap.add_argument("--tokenizer", default="")
+    ap.add_argument("--vocab", type=int, default=32768)
+    ap.add_argument("--bpe_train_docs", type=int, default=50000)
+    # model
+    ap.add_argument("--dim", type=int, default=128)
+    ap.add_argument("--kraus", type=int, default=4)
+    # optimization
+    ap.add_argument("--block", type=int, default=512)
+    ap.add_argument("--batch", type=int, default=16)
+    ap.add_argument("--grad_accum", type=int, default=8)
+    ap.add_argument("--tbptt", type=int, default=128)
+    ap.add_argument("--steps", type=int, default=50000)
+    ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--warmup", type=int, default=2000)
+    ap.add_argument("--clip", type=float, default=1.0)
+    # infra
+    ap.add_argument("--device", default="auto")
+    ap.add_argument("--threads", type=int, default=0)
+    ap.add_argument("--eval_every", type=int, default=1000)
+    ap.add_argument("--eval_batches", type=int, default=20)
+    ap.add_argument("--ckpt_every", type=int, default=2000)
+    ap.add_argument("--out", default=os.path.join(HERE, "artifacts"))
+    ap.add_argument("--tag", default="qclm_scale")
+    ap.add_argument("--seed", type=int, default=0)
+    args = ap.parse_args()
+
+    torch.manual_seed(args.seed)
+    if args.threads:
+        torch.set_num_threads(args.threads)
+    os.makedirs(args.out, exist_ok=True)
+    device = get_device(args.device)
+    print("device:", device)
+
+    tok = build_or_load_tokenizer(args)
+    V = tok.vocab_size
+    print("vocab_size:", V)
+
+    def new_stream():
+        kw = dict(source=args.source)
+        if args.source == "fineweb":
+            kw.update(name=args.fineweb_name, dataset=args.fineweb_dataset)
+        else:
+            kw.update(path=args.local_path, loop=True)
+        return make_stream(tok, args.block, args.batch, tok.eot_id, **kw)
+
+    stream = new_stream()
+    print("pulling held-out eval set ...")
+    eval_batches = [next(stream) for _ in range(args.eval_batches)]
+
+    model = QuantumChannelLM(V, dim=args.dim, kraus=args.kraus).to(device)
+    params = model.num_params()
+    print(f"model params: {params/1e9:.3f}B  (dim={args.dim} kraus={args.kraus} V={V})")
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95),
+                            weight_decay=0.0)
+
+    def lr_at(step):
+        if step < args.warmup:
+            return args.lr * (step + 1) / args.warmup
+        prog = (step - args.warmup) / max(1, args.steps - args.warmup)
+        return args.lr * (0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * min(prog, 1.0))))
+
+    logf = open(os.path.join(args.out, f"{args.tag}_log.jsonl"), "w")
+    cfg = vars(args).copy(); cfg.update(vocab_size=V, num_params=params, device=str(device))
+    logf.write(json.dumps({"type": "config", **cfg}) + "\n"); logf.flush()
+    print("CONFIG:", json.dumps(cfg))
+
+    model.train()
+    t0 = time.time(); run_nll, run_tok = 0.0, 0; best = float("inf"); seen_tok = 0
+    for step in range(args.steps):
+        for pg in opt.param_groups:
+            pg["lr"] = lr_at(step)
+        opt.zero_grad(set_to_none=True)
+        acc_nll = 0.0
+        for _ in range(args.grad_accum):
+            seqs = next(stream).to(device)
+            out = model.forward(seqs, tbptt=args.tbptt)
+            (out["loss"] / args.grad_accum).backward()
+            acc_nll += out["nll_sum"].item(); run_tok += out["n_tokens"]; seen_tok += out["n_tokens"]
+        run_nll += acc_nll
+        gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
+        opt.step()
+
+        if (step + 1) % 20 == 0:
+            tr_bits = (run_nll / run_tok) / LN2; run_nll, run_tok = 0.0, 0
+            tps = seen_tok / (time.time() - t0)
+            print(f"step {step+1:6d} | train {tr_bits:.3f} b/tok | lr {lr_at(step):.1e} | "
+                  f"gnorm {gnorm:.2f} | {tps:.0f} tok/s | seen {seen_tok/1e6:.1f}M")
+        if (step + 1) % args.eval_every == 0:
+            vb = evaluate(model, eval_batches, device, args.tbptt)
+            print(f"   >>> step {step+1}: VAL {vb:.3f} bits/token | {seen_tok/1e6:.1f}M tokens")
+            logf.write(json.dumps({"type": "eval", "step": step + 1, "val_bits": vb,
+                                   "seen_tokens": seen_tok, "time": time.time() - t0}) + "\n"); logf.flush()
+            try:
+                ids = model.generate(tok.encode("\n"), n_new=80, temperature=0.8, seed=1)
+                print("   SAMPLE:", repr(tok.decode(ids)[:200]))
+            except Exception as e:
+                print("   sample failed:", e)
+            if vb < best:
+                best = vb
+                torch.save({"model": model.state_dict(), "cfg": cfg, "tokenizer_path": args.tokenizer,
+                            "val_bits": vb, "step": step + 1},
+                           os.path.join(args.out, f"{args.tag}_best.pt"))
+        if (step + 1) % args.ckpt_every == 0:
+            torch.save({"model": model.state_dict(), "cfg": cfg, "step": step + 1},
+                       os.path.join(args.out, f"{args.tag}_last.pt"))
+
+    logf.write(json.dumps({"type": "final", "best_val_bits": best,
+                           "wall_time": time.time() - t0, "seen_tokens": seen_tok}) + "\n")
+    logf.close()
+    print(f"DONE best={best:.3f} bits/tok, {seen_tok/1e6:.1f}M tokens, {time.time()-t0:.0f}s")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,14 @@
+{"type": "config", "data": "/mnt/session/outputs/quantum-lm/data/tinyshakespeare.txt", "dim": 48, "kraus": 4, "block": 64, "batch": 32, "steps": 1800, "lr": 0.003, "clip": 1.0, "warmup": 100, "eval_every": 300, "eval_batches": 20, "decohere": false, "threads": 4, "seed": 0, "out": "/mnt/session/outputs/quantum-lm/artifacts", "tag": "q_d48", "corpus_frac": 1.0, "vocab_size": 65, "num_params": 1198176}
+{"type": "eval", "step": 300, "val_bits": 2.8865442388266587, "time": 151.50159978866577}
+{"type": "sample", "step": 300, "text": "\nMand shougneth fopod;\nTo of\nCOUCENELNGELOMIO:\nIned to say such out what is were allet wi$nst breath hear o'er a we reng mour heck! the this doon be what sa$l thapance and is blou can kick frostler the Nordly deave his by pail will your a so"}
+{"type": "eval", "step": 600, "val_bits": 2.841798404454233, "time": 332.7981023788452}
+{"type": "sample", "step": 600, "text": "\nMander ourn?\nWruepod;\nTo our wot;\nUnd agut we wheir I park be hout what is were agee an I whee hive\nAnd move war work thy and the gresor Us, hand cold I such thapance and is blow cameke heary;\nI run, baw\nThy deave his by parld hoxue to Uor\n"}
+{"type": "eval", "step": 900, "val_bits": 2.824195686974152, "time": 492.436874628067}
+{"type": "sample", "step": 900, "text": "\nMan\nTo ourn?\nWruepop; his that that that Must wheir I park be hout what is were agse will,\nO brieve heardon cor we reng more he pents\nothis dood lead a but so to and a son &O:\nThe am kice alls ler the a cloy deave his by parld hoxue to a so"}
+{"type": "eval", "step": 1200, "val_bits": 2.824871933340892, "time": 650.8102066516876}
+{"type": "sample", "step": 1200, "text": "\n\nWARK:\nTo noth fopod; his that that that the coneird that such out what is were agse an I whee hive heardon cor your no moth of men me these hand colt I say devap hard, on my lience.\nke he lostler the Nordly deave his by parld hoxue to a so"}
+{"type": "eval", "step": 1500, "val_bits": 2.806673014982379, "time": 807.732396364212}
+{"type": "sample", "step": 1500, "text": "\nManter ourn?\nWruepody his that that that Must wheir I park be hout what is were allet then, set it\nWhe thou cork I reng moy and men me these hand colt I such thapance and is blow cameke he lostler the Nordly deave his by parld hoxue to a so"}
+{"type": "eval", "step": 1800, "val_bits": 2.8058754557579615, "time": 966.0061566829681}
+{"type": "sample", "step": 1800, "text": "\nMan is ourn?\nWruepody his that that that Must wheir I say such out what is were allet then, set it\nWhe thou cork I reng moy and men me these hand colt I such thapance and is blow came do falls yet the swally deave his by parld hoxue to a so"}
+{"type": "final", "best_val_bits": 2.8058754557579615, "wall_time": 966.1781568527222}

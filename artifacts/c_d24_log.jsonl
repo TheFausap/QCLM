@@ -1,0 +1,14 @@
+{"type": "config", "data": "/mnt/session/outputs/quantum-lm/data/tinyshakespeare.txt", "dim": 24, "kraus": 4, "block": 64, "batch": 32, "steps": 1800, "lr": 0.003, "clip": 1.0, "warmup": 100, "eval_every": 300, "eval_batches": 20, "decohere": true, "threads": 4, "seed": 0, "out": "/mnt/session/outputs/quantum-lm/artifacts", "tag": "c_d24", "corpus_frac": 1.0, "vocab_size": 65, "num_params": 299568}
+{"type": "eval", "step": 300, "val_bits": 3.275821357657611, "time": 82.69002771377563}
+{"type": "sample", "step": 300, "text": "\nMand shounneth fop py his thavet;\nUnd agithe heleir I sato be hout what is wus vadse will wh brow sour, mose war work this Eake penensothis donen co hat sat dert ance anon dato hichiske he bys lert by a ally deal thithe, pe,\n\nKMLIMPLBLLUG:\n"}
+{"type": "eval", "step": 600, "val_bits": 3.234826908351154, "time": 172.51272177696228}
+{"type": "sample", "step": 600, "text": "\nMame shounneth fopou; hiche\nGout;\nUs bat Mut hellizind ank be hout what ther sove.\nWind I wh ere thour, mose gave son gome Enge pent sothis done leal a but so to ance anon matle but ake heares lerfard a ally deal thithe, pall will youn a th"}
+{"type": "eval", "step": 900, "val_bits": 3.2215437431142053, "time": 300.2877743244171}
+{"type": "sample", "step": 900, "text": "\nMame shoun hon fopou; his th wot;\nUs bat the hened th sato be hout what ther span.\nWind I wh brow sour, mose wat work him; Enge lent sothis done leal a but so to ance anon matle but ake he;\n\nA:\nFron, bawedly deal thithe, twill hor Poun a th"}
+{"type": "eval", "step": 1200, "val_bits": 3.2165816848545448, "time": 428.3510138988495}
+{"type": "sample", "step": 1200, "text": "\n\nE:\n\nALEN:\n\nEU CERCEMOCA:\nTh wot;\nUs bathine hened th fato be hout whats me, span.\nWind I wh brow sour, mose wat work him and the none this done be what sus devaphon ang bor.\n\nA:\n\nIIRRRKLICEU:\nIr this a anky deal thithe, pall will youn a th"}
+{"type": "eval", "step": 1500, "val_bits": 3.207896232895993, "time": 565.7502591609955}
+{"type": "sample", "step": 1500, "text": "\nMame shoun sth fopou; his th wot;\nUs bage nor wheir I fato be hout whats me, span.\nWind I wh brow sour, most wat work him; Eant ment sothis done be what sus devaphon ang boresle but.\nBece fous lertard a ally deal of the, twill hor youn a th"}
+{"type": "eval", "step": 1800, "val_bits": 3.2093230644688377, "time": 741.9479002952576}
+{"type": "sample", "step": 1800, "text": "\nMame shounten reepou; his th wot;\nUs bathine hened th sato be hout whats me, span.\nWind I wh brow sour, most wat work thiold hes werss this done least I sus devaphon ang bor.\n\nA:\n\nIIRRRKLICEU:\nIr this a anky deal thithe, twill hor youn a th"}
+{"type": "final", "best_val_bits": 3.207896232895993, "wall_time": 742.1070184707642}

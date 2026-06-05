@@ -1,0 +1,40 @@
+========================================================================
+QUANTUM (n=48, val 2.806 bits/char)  vs  CLASSICAL/DECOHERED (n=48, val 3.039)
+========================================================================
+
+##### QUANTUM — free generation (temp 0.7, top_k 10) #####
+
+What if anot mens a prepairer son of your beat and a disshore the hath of and blicher.
+
+RING OLARE MOLARE EREN ENTARINIUKENTIO VINIAME ORGARDIR:
+With to the crest that in of in her of to tall seem
+We pleeded shot stay thing, and the dack you fast man, at for the the me,
+I'ty her the stant it wome my shou her in be fray
+
+##### CLASSICAL (decohered HMM) — free generation (temp 0.7, top_k 10) #####
+
+Was mird to shear sof, there thes to frigh, be and a shish besur this but and bor to one ins and me that frones then oursell seet he hear for want the be the thy to he in ow's for wof to there wemper hather thictind mousin, and than therou we as my and is the the with war'd shortheg stont it woe for ang
+
+LOS:
+Sead frat
+
+========================================================================
+QUANTUM prompted continuations (temp 0.6, top_k 8)
+========================================================================
+
+PROMPT> 'ROMEO:\n'
+ROMEO:
+What with to hell sort the cur may to so we tell strord at and the more have to shou we this my stall wour that my here it why have man on a prear thou me the w
+
+PROMPT> 'KING:\n'
+KING:
+Whe cander all whou and in then and the his he such in the cord the me that whis may wear me of the hence,
+And wome the wilt they the day had so sure man as his
+
+PROMPT> 'My lord, I '
+My lord, I my dear how sholour the to so was there me
+What he his my water make have the hath is a cher the more that we man this here this fath at as that the word with m
+
+PROMPT> 'First Citizen:\n'
+First Citizen:
+That and and her her hell he be suld her be that hader in the plow and the prom her be she that to me it this so fring and and the send art than the have the he

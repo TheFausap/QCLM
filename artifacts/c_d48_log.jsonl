@@ -1,0 +1,14 @@
+{"type": "config", "data": "/mnt/session/outputs/quantum-lm/data/tinyshakespeare.txt", "dim": 48, "kraus": 4, "block": 64, "batch": 32, "steps": 1800, "lr": 0.003, "clip": 1.0, "warmup": 100, "eval_every": 300, "eval_batches": 20, "decohere": true, "threads": 4, "seed": 0, "out": "/mnt/session/outputs/quantum-lm/artifacts", "tag": "c_d48", "corpus_frac": 1.0, "vocab_size": 65, "num_params": 1198176}
+{"type": "eval", "step": 300, "val_bits": 3.1131176841109167, "time": 176.4158444404602}
+{"type": "sample", "step": 300, "text": "\nMame shou neth fopou;\n\nA:\nThat thich bath nor wheir I say such out what is wery anse will,\nO bris some, move war work gomou ang, weres this done ler thers.\nWo to ance and id ble but.\nBece frastler the Nondly deal thith ye will hory, to a th"}
+{"type": "eval", "step": 600, "val_bits": 3.065481914657969, "time": 356.2333519458771}
+{"type": "sample", "step": 600, "text": "\nMame shou neth for por don say the stait Mut hened thourto be hout what is we that end, I whieth there, move wive son gomou and land sothis done leal a butes thy ance and is ble buty knor frastlere be a and cather his by pall will ye,\nWick\n"}
+{"type": "eval", "step": 900, "val_bits": 3.0540385764274056, "time": 540.3074357509613}
+{"type": "sample", "step": 900, "text": "\nMame shou not reepod; his than than that Mus hengire that such out whans my, stay.\nWive I whieth them, thou cor wene no mou and land sothis done leal a butes than harter bourtly buty kno farth lerfan baw\nThy deal of the, pall will ye,\nWick\n"}
+{"type": "eval", "step": 1200, "val_bits": 3.053302215509471, "time": 724.8150663375854}
+{"type": "sample", "step": 1200, "text": "\nMame shourner reepof and ount of frond thour hengire that such out whans my, stands to thes set it\n\nS:\nCive cor wene no mou and pants ow is done be what sum devape cathion dath hich.\nBecear's blerfan baw\nThy deal this by pall will ye,\nWick\n"}
+{"type": "eval", "step": 1500, "val_bits": 3.044590905827068, "time": 901.5323724746704}
+{"type": "sample", "step": 1500, "text": "\nMame shourner reepof and ount of frond thous hengire that such out whans my, stay.\nWive I whieth them, thou cor wene them and the gonsothest hon lealt I sull than harter bourtly buty kind frastler the a and creal of the, pall will ye,\nWick\n"}
+{"type": "eval", "step": 1800, "val_bits": 3.0394653190544836, "time": 1074.994187116623}
+{"type": "sample", "step": 1800, "text": "\nMame shourner reepof and ount your stait Mus hengire that such out whans my, stands to thes set it\n\nS:\n\nTo shor wene them and the nons these hon lealt I such than harter bourtly buty kind frastler the a and hather his by pall will ye,\nWick\n"}
+{"type": "final", "best_val_bits": 3.0394653190544836, "wall_time": 1075.181578874588}

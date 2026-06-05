@@ -1,0 +1,15 @@
+{
+  "baselines": {
+    "uniform": 6.022,
+    "unigram": 4.829,
+    "bigram": 3.583,
+    "trigram": 2.952,
+    "4-gram": 2.574
+  },
+  "models": {
+    "quantum_n24": 3.0079830915227728,
+    "classical(decohered)_n24": 3.207896232895993,
+    "quantum_n48": 2.8058754557579615,
+    "classical(decohered)_n48": 3.0394653190544836
+  }
+}

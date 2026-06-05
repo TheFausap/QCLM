@@ -1,0 +1,14 @@
+{"type": "config", "data": "/mnt/session/outputs/quantum-lm/data/tinyshakespeare.txt", "dim": 24, "kraus": 4, "block": 64, "batch": 32, "steps": 1800, "lr": 0.003, "clip": 1.0, "warmup": 100, "eval_every": 300, "eval_batches": 20, "decohere": false, "threads": 4, "seed": 0, "out": "/mnt/session/outputs/quantum-lm/artifacts", "tag": "q_d24", "corpus_frac": 1.0, "vocab_size": 65, "num_params": 299568}
+{"type": "eval", "step": 300, "val_bits": 3.088799045172998, "time": 66.72253513336182}
+{"type": "sample", "step": 300, "text": "\nMand shougn? Wre pod;\n\nAR:\n\nCAUTARUS:\n\nLEMAPUSIDeir or ank be hout whatlis wus vadse will wheeth thour thous wave sok thy aEO:\n\nFenensothesed and cow a$ve.\nWo to ance and is blor cay kd he;\n\nLIUFro$re Noully deave his by pall will yount Gro"}
+{"type": "eval", "step": 600, "val_bits": 3.041146443645716, "time": 135.47822856903076}
+{"type": "sample", "step": 600, "text": "\nMand shougnet re pod;\n\nARDTUCAUMARUSNSENTENIN IDE:\nAnd ank be hout what is wue va.\nWin, I whee hiththt, move growen knou our heclenensothese hand cow a but so to ance and is blord as kere frostlerlard Noully deave his by pall wilxue to a th"}
+{"type": "eval", "step": 900, "val_bits": 3.0244481622886044, "time": 203.92268824577332}
+{"type": "sample", "step": 900, "text": "\nMand shougneth fopod;\n\nARDTI:\nIt;\nUnd a dout hellizen fath be hout what is wery alse an I whee hitht the o's wave son hem and the nome these hand cow a but so to ance and is blord as kere frostlerlard Noully deave his by pall will is,\nLood\n"}
+{"type": "eval", "step": 1200, "val_bits": 3.025493969208938, "time": 275.50567269325256}
+{"type": "sample", "step": 1200, "text": "\nMand shougnet reep do his that that that the hellizen fath be hauth thold your vadse an I whee hitht kat o'er a we yong moth he penensothese hand cow a but so to ance and is blord as kich frostlerlard Noully deal of the, pall will is,\nWo th"}
+{"type": "eval", "step": 1500, "val_bits": 3.0079830915227728, "time": 346.2255291938782}
+{"type": "sample", "step": 1500, "text": "\nMand shougnet reepod;\n\nARDTI:\nIt;\nUnd a dout hellizen fatk be hout what is wue va.\nWin, I whee hitht kat o' cor we yong moth he lenensothese hand cold I sues thap hart, on matle but ake he by blerl be Nordly deave his by pall will is,\nWo th"}
+{"type": "eval", "step": 1800, "val_bits": 3.008067776838412, "time": 415.99915623664856}
+{"type": "sample", "step": 1800, "text": "\nMand shougnet reepod; his that that that Mut hellizen satk be haut what is wue va.\nWin, I whee hithther move wave son hem and the none the thound cow a but so to ance and is blord as kich frostlerl be a ally deave his by pall will is,\nWo th"}
+{"type": "final", "best_val_bits": 3.0079830915227728, "wall_time": 416.1075258255005}
