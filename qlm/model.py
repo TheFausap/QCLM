@@ -31,6 +31,20 @@ Decoherence ablation
 Zeroing the off-diagonal entries of rho after every step destroys quantum
 coherence and collapses the model to a classical n-state Hidden Markov Model.
 Comparing the two isolates the contribution of genuine quantum interference.
+
+Fast-kernel mode (fast_kernels=True)
+-------------------------------------
+On CUDA, complex64 einsum is not natively accelerated by tensor cores. The
+per-token state update is replaced with real 2x2 block matmuls in bf16:
+
+    A_block = [[Ar, -Ai], [Ai,  Ar]]   (2n x 2n)
+    B_block = [Br; Bi]                  (2n x  n)
+    C_block = A_block @ B_block         (2n x  n)  -> Cr = C_block[:n], Ci = C_block[n:]
+
+A complex (n x n) @ (n x n) becomes one (2n x 2n) @ (2n x n) bf16 matmul, which
+fully utilises Blackwell/Hopper tensor cores. fp32 master weights are preserved in
+Kr/Ki; the optimizer step is unaffected. The isometry projection stays in fp32/
+complex64 for numerical stability (called once per forward, not per token).
 """
 from __future__ import annotations
 import math
@@ -48,9 +62,52 @@ def _inv_sqrt_hermitian(G: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return inv_sqrt
 
 
+def _cplx_mm_block(
+    Ar: torch.Tensor, Ai: torch.Tensor,
+    Br: torch.Tensor, Bi: torch.Tensor,
+    cdtype: torch.dtype = torch.bfloat16,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """C = (Ar+i·Ai) @ (Br+i·Bi) via a single real 2×2-block matmul in cdtype.
+
+    Packs the four real sub-products into one larger matmul, giving tensor cores
+    a bigger tile and a single kernel launch instead of four:
+
+        A_block = [[Ar, −Ai], [Ai, Ar]]   shape (..., 2m, 2k)
+        B_block = [Br; Bi]                 shape (..., 2k,  n)
+        C_block = A_block @ B_block        shape (..., 2m,  n)
+          → Cr = C_block[..., :m, :]
+            Ci = C_block[..., m:, :]
+    """
+    m = Ar.shape[-2]
+    A_block = torch.cat([torch.cat([Ar, -Ai], dim=-1),
+                         torch.cat([Ai,  Ar], dim=-1)], dim=-2).to(cdtype)
+    B_block = torch.cat([Br, Bi], dim=-2).to(cdtype)
+    C = (A_block @ B_block).to(Ar.dtype)
+    return C[..., :m, :], C[..., m:, :]
+
+
+def _cplx_mm_dag_block(
+    Ar: torch.Tensor, Ai: torch.Tensor,
+    Br: torch.Tensor, Bi: torch.Tensor,
+    cdtype: torch.dtype = torch.bfloat16,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """C = (Ar+i·Ai) @ (Br+i·Bi)†  via real 2×2-block matmul in cdtype.
+
+    B† = (Br − i·Bi).mT  ⟹  B†_r = Br.mT,  B†_i = −Bi.mT
+    """
+    return _cplx_mm_block(Ar, Ai, Br.mT, -Bi.mT, cdtype)
+
+
 class QuantumChannelLM(nn.Module):
     def __init__(self, vocab_size: int, dim: int = 48, kraus: int = 4,
-                 cdtype: torch.dtype = torch.complex64, init_scale: float = 1.0):
+                 cdtype: torch.dtype = torch.complex64, init_scale: float = 1.0,
+                 fast_kernels: bool = False,
+                 compute_dtype: torch.dtype = torch.bfloat16):
+        """
+        fast_kernels: replace per-token complex64 einsums with real 2×2-block bf16
+                      matmuls on CUDA (no-op on CPU; architecture unchanged).
+        compute_dtype: dtype used for the block matmuls (default bfloat16).
+        """
         super().__init__()
         self.vocab_size = vocab_size
         self.n = dim
@@ -58,6 +115,8 @@ class QuantumChannelLM(nn.Module):
         self.cdtype = cdtype
         rdtype = torch.float32 if cdtype == torch.complex64 else torch.float64
         self.rdtype = rdtype
+        self.fast_kernels = fast_kernels
+        self.compute_dtype = compute_dtype
 
         V = vocab_size
         n = dim
@@ -118,8 +177,7 @@ class QuantumChannelLM(nn.Module):
         and optionally per-step probability distributions.
         """
         B, L = tokens.shape
-        n = self.n
-        K = self.kraus_operators()        # (V, W, n, n)
+        K = self.kraus_operators()        # (V, W, n, n) complex64
         # The full POVM (all vocab) is ONLY needed to monitor full distributions;
         # training does not need it (see below), which makes cost independent of V.
         M = self.povm(K) if return_probs else None
@@ -131,30 +189,84 @@ class QuantumChannelLM(nn.Module):
         n_tokens = B * L
         prob_log = [] if return_probs else None
 
-        for t in range(L):
-            tgt = tokens[:, t]            # (B,)
-            if return_probs:
-                pall = torch.einsum('bij,xji->bx', rho, M).real    # (B, V)
-                pall = pall.clamp_min(eps)
-                prob_log.append(pall.detach() / pall.sum(-1, keepdim=True))
+        use_fast = self.fast_kernels and tokens.device.type == 'cuda'
 
-            # Post-measurement (unnormalized) state with the observed token.
-            # Key identity: p(x_t | x_<t) = Tr(rho M_{x_t}) = Tr(E_{x_t}(rho)) = Tr(E).
-            # So the next-token probability falls out of the state update for FREE,
-            # and we never form the full-vocab readout during training. Cost per
-            # step is O(B * W * n^3), INDEPENDENT of vocabulary size V.
-            Kx = K[tgt]                    # (B, W, n, n)
-            Krho = torch.einsum('bwij,bjk->bwik', Kx, rho)         # (B, W, n, n)
-            E = torch.einsum('bwik,bwlk->bil', Krho, Kx.conj())    # (B, n, n) = sum_w K rho K^dag
-            p_tgt = torch.einsum('bii->b', E).real.clamp_min(eps)  # (B,) = Tr(E) = Born prob
-            nll_sum = nll_sum - torch.log(p_tgt).sum()
-            rho = E / p_tgt[:, None, None]
-            if decohere:
-                diag = torch.diagonal(rho, dim1=-2, dim2=-1).real  # (B, n)
-                rho = torch.diag_embed(diag.to(rho.dtype))
-                rho = rho / diag.sum(-1).clamp_min(eps)[:, None, None]
-            if tbptt and (t + 1) % tbptt == 0:
-                rho = rho.detach()
+        if use_fast:
+            # Split projected Kraus into real/imag float32 views (no copy).
+            # Gradients flow correctly: .real/.imag are differentiable on complex tensors.
+            Kr_iso = K.real   # (V, W, n, n) float32
+            Ki_iso = K.imag
+            # Initial state split; clone because .real/.imag are strided views.
+            rho_r = rho.real.clone()   # (B, n, n) float32
+            rho_i = rho.imag.clone()
+            cdtype = self.compute_dtype
+
+            for t in range(L):
+                tgt = tokens[:, t]            # (B,)
+
+                if return_probs:
+                    pall = torch.einsum('bij,xji->bx',
+                                        torch.complex(rho_r, rho_i), M).real
+                    pall = pall.clamp_min(eps)
+                    prob_log.append(pall.detach() / pall.sum(-1, keepdim=True))
+
+                Kr_x = Kr_iso[tgt]            # (B, W, n, n)
+                Ki_x = Ki_iso[tgt]
+
+                # Krho = Kx @ rho  — one 2×2-block bf16 matmul
+                Krho_r, Krho_i = _cplx_mm_block(
+                    Kr_x, Ki_x,
+                    rho_r.unsqueeze(1), rho_i.unsqueeze(1),  # (B, 1, n, n)
+                    cdtype)                                   # → (B, W, n, n)
+
+                # E = sum_w Krho @ Kx†  — one 2×2-block bf16 matmul per W, summed
+                E_r, E_i = _cplx_mm_dag_block(Krho_r, Krho_i, Kr_x, Ki_x, cdtype)
+                E_r = E_r.sum(1)   # (B, n, n)
+                E_i = E_i.sum(1)
+
+                # p = Tr(E)  (imaginary part is zero for Hermitian E)
+                p_tgt = E_r.diagonal(dim1=-2, dim2=-1).sum(-1).clamp_min(eps)  # (B,)
+                nll_sum = nll_sum - torch.log(p_tgt).sum()
+
+                rho_r = E_r / p_tgt[:, None, None]
+                rho_i = E_i / p_tgt[:, None, None]
+
+                if decohere:
+                    diag = rho_r.diagonal(dim1=-2, dim2=-1)   # (B, n)
+                    rho_r = torch.diag_embed(diag)
+                    rho_i = torch.zeros_like(rho_r)
+                    rho_r = rho_r / diag.sum(-1).clamp_min(eps)[:, None, None]
+
+                if tbptt and (t + 1) % tbptt == 0:
+                    rho_r = rho_r.detach()
+                    rho_i = rho_i.detach()
+
+        else:
+            # Original complex64 einsum path (CPU / debugging / no fast_kernels).
+            for t in range(L):
+                tgt = tokens[:, t]            # (B,)
+                if return_probs:
+                    pall = torch.einsum('bij,xji->bx', rho, M).real    # (B, V)
+                    pall = pall.clamp_min(eps)
+                    prob_log.append(pall.detach() / pall.sum(-1, keepdim=True))
+
+                # Post-measurement (unnormalized) state with the observed token.
+                # Key identity: p(x_t | x_<t) = Tr(rho M_{x_t}) = Tr(E_{x_t}(rho)) = Tr(E).
+                # So the next-token probability falls out of the state update for FREE,
+                # and we never form the full-vocab readout during training. Cost per
+                # step is O(B * W * n^3), INDEPENDENT of vocabulary size V.
+                Kx = K[tgt]                    # (B, W, n, n)
+                Krho = torch.einsum('bwij,bjk->bwik', Kx, rho)         # (B, W, n, n)
+                E = torch.einsum('bwik,bwlk->bil', Krho, Kx.conj())    # (B, n, n)
+                p_tgt = torch.einsum('bii->b', E).real.clamp_min(eps)  # (B,)
+                nll_sum = nll_sum - torch.log(p_tgt).sum()
+                rho = E / p_tgt[:, None, None]
+                if decohere:
+                    diag = torch.diagonal(rho, dim1=-2, dim2=-1).real  # (B, n)
+                    rho = torch.diag_embed(diag.to(rho.dtype))
+                    rho = rho / diag.sum(-1).clamp_min(eps)[:, None, None]
+                if tbptt and (t + 1) % tbptt == 0:
+                    rho = rho.detach()
 
         loss = nll_sum / n_tokens
         out = {"loss": loss, "nll_sum": nll_sum.detach(), "n_tokens": n_tokens}
@@ -174,17 +286,40 @@ class QuantumChannelLM(nn.Module):
         eps = 1e-12
         out_ids: list[int] = []
 
+        use_fast = self.fast_kernels and rho.device.type == 'cuda'
+        # Always define rho_r/rho_i so the closure can declare them nonlocal
+        rho_r = rho.real.clone() if use_fast else None
+        rho_i = rho.imag.clone() if use_fast else None
+        cdtype = self.compute_dtype
+
         def step_update(tok_id: int):
-            nonlocal rho
-            Kx = K[tok_id].unsqueeze(0)                            # (1, W, n, n)
-            Krho = torch.einsum('bwij,bjk->bwik', Kx, rho)
-            E = torch.einsum('bwik,bwlk->bil', Krho, Kx.conj())
-            p = torch.einsum('bii->b', E).real.clamp_min(eps)
-            rho = E / p[:, None, None]
-            if decohere:
-                diag = torch.diagonal(rho, dim1=-2, dim2=-1).real
-                rho = torch.diag_embed(diag.to(rho.dtype))
-                rho = rho / diag.sum(-1).clamp_min(eps)[:, None, None]
+            nonlocal rho, rho_r, rho_i
+            if use_fast:
+                Kx_r = K.real[tok_id].unsqueeze(0)   # (1, W, n, n)
+                Kx_i = K.imag[tok_id].unsqueeze(0)
+                Krho_r, Krho_i = _cplx_mm_block(
+                    Kx_r, Kx_i,
+                    rho_r.unsqueeze(1), rho_i.unsqueeze(1), cdtype)
+                E_r, E_i = _cplx_mm_dag_block(Krho_r, Krho_i, Kx_r, Kx_i, cdtype)
+                E_r = E_r.sum(1); E_i = E_i.sum(1)
+                p = E_r.diagonal(dim1=-2, dim2=-1).sum(-1).clamp_min(eps)
+                rho_r = E_r / p[:, None, None]
+                rho_i = E_i / p[:, None, None]
+                if decohere:
+                    diag = rho_r.diagonal(dim1=-2, dim2=-1)
+                    rho_r = torch.diag_embed(diag)
+                    rho_i = torch.zeros_like(rho_r)
+                    rho_r = rho_r / diag.sum(-1).clamp_min(eps)[:, None, None]
+            else:
+                Kx = K[tok_id].unsqueeze(0)                            # (1, W, n, n)
+                Krho = torch.einsum('bwij,bjk->bwik', Kx, rho)
+                E = torch.einsum('bwik,bwlk->bil', Krho, Kx.conj())
+                p = torch.einsum('bii->b', E).real.clamp_min(eps)
+                rho = E / p[:, None, None]
+                if decohere:
+                    diag = torch.diagonal(rho, dim1=-2, dim2=-1).real
+                    rho = torch.diag_embed(diag.to(rho.dtype))
+                    rho = rho / diag.sum(-1).clamp_min(eps)[:, None, None]
 
         # consume the prompt (teacher forcing)
         if prompt_ids:
@@ -193,7 +328,10 @@ class QuantumChannelLM(nn.Module):
                 step_update(tid)
 
         for _ in range(n_new):
-            pall = torch.einsum('bij,xji->bx', rho, M).real.squeeze(0)  # (V,)
+            # Full-vocab readout always uses the complex path (generation bottleneck
+            # is the O(V·n²) pall einsum, not the state update).
+            rho_cplx = torch.complex(rho_r, rho_i) if use_fast else rho
+            pall = torch.einsum('bij,xji->bx', rho_cplx, M).real.squeeze(0)  # (V,)
             pall = pall.clamp_min(eps)
             logits = torch.log(pall) / max(temperature, 1e-6)
             if top_k is not None:

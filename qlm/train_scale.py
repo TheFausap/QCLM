@@ -78,6 +78,8 @@ def main():
     # model
     ap.add_argument("--dim", type=int, default=128)
     ap.add_argument("--kraus", type=int, default=4)
+    ap.add_argument("--fast_kernels", action="store_true",
+                    help="use real 2x2-block bf16 matmuls instead of complex64 einsums (CUDA only)")
     # optimization
     ap.add_argument("--block", type=int, default=512)
     ap.add_argument("--batch", type=int, default=16)
@@ -121,7 +123,8 @@ def main():
     print("pulling held-out eval set ...")
     eval_batches = [next(stream) for _ in range(args.eval_batches)]
 
-    model = QuantumChannelLM(V, dim=args.dim, kraus=args.kraus).to(device)
+    model = QuantumChannelLM(V, dim=args.dim, kraus=args.kraus,
+                             fast_kernels=args.fast_kernels).to(device)
     params = model.num_params()
     print(f"model params: {params/1e9:.3f}B  (dim={args.dim} kraus={args.kraus} V={V})")
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95),
