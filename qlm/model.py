@@ -60,14 +60,46 @@ import torch
 import torch.nn as nn
 
 
+class _InvSqrtHermitian(torch.autograd.Function):
+    """Differentiable G^{-1/2} for Hermitian PSD G.
+
+    PyTorch's built-in eigh backward raises an error for complex matrices when
+    eigenvalues are degenerate (which happens naturally during training). The
+    function G → G^{-1/2} is phase-invariant, so its gradient is always
+    well-defined. We implement the backward via the Loewner matrix formula:
+
+        F_ij = -1 / (s_i * s_j * (s_i + s_j)),  s_i = sqrt(lambda_i)
+
+    This formula is regular even when s_i = s_j, bypassing the eigh check.
+    """
+
+    @staticmethod
+    def forward(ctx, G: torch.Tensor, eps: float) -> torch.Tensor:
+        G = 0.5 * (G + G.conj().mH)
+        evals, evecs = torch.linalg.eigh(G)
+        s = evals.real.clamp(min=eps).sqrt()           # (n,) real sqrt-eigenvalues
+        inv_sqrt = evecs @ torch.diag_embed((1.0 / s).to(evecs.dtype)) @ evecs.conj().mH
+        ctx.save_for_backward(evecs, s)                # keep s real for Loewner math
+        return inv_sqrt
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):
+        evecs, s = ctx.saved_tensors                   # evecs: complex, s: real
+        # Rotate gradient to eigenbasis
+        grad_V = evecs.conj().mH @ grad_out @ evecs    # (n, n) complex
+        # Loewner matrix (real): F_ij = -1 / (s_i * s_j * (s_i + s_j))
+        si = s.unsqueeze(-1); sj = s.unsqueeze(-2)
+        F = (-1.0 / (si * sj * (si + sj)).clamp(min=1e-30)).to(grad_V.dtype)  # cast to complex
+        # Symmetrize to Hermitian part (only Hermitian perturbations matter for G)
+        grad_G_V = F * (0.5 * (grad_V + grad_V.conj().mH))
+        # Rotate back to original basis
+        grad_G = evecs @ grad_G_V @ evecs.conj().mH
+        return grad_G, None                            # None for eps (non-tensor)
+
+
 def _inv_sqrt_hermitian(G: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    """G^{-1/2} for a Hermitian PSD matrix via eigendecomposition (differentiable)."""
-    # symmetrize for numerical Hermiticity
-    G = 0.5 * (G + G.conj().transpose(-1, -2))
-    evals, evecs = torch.linalg.eigh(G)
-    evals = torch.clamp(evals.real, min=eps)
-    inv_sqrt = evecs @ torch.diag_embed((evals ** -0.5).to(evecs.dtype)) @ evecs.conj().transpose(-1, -2)
-    return inv_sqrt
+    """G^{-1/2} for a Hermitian PSD matrix (custom backward, degenerate-eigenvalue safe)."""
+    return _InvSqrtHermitian.apply(G, eps)
 
 
 def _cplx_mm_block(
