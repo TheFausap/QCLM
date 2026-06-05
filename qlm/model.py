@@ -45,6 +45,14 @@ A complex (n x n) @ (n x n) becomes one (2n x 2n) @ (2n x n) bf16 matmul, which
 fully utilises Blackwell/Hopper tensor cores. fp32 master weights are preserved in
 Kr/Ki; the optimizer step is unaffected. The isometry projection stays in fp32/
 complex64 for numerical stability (called once per forward, not per token).
+
+Additionally, forward() pre-gathers all Kraus operators for the sequence in one
+batched index (Kr_seq = Kr_iso[tokens], shape B x L x W x n x n) and delegates
+the per-token scan to a torch.compile'd chunk function (_SCAN_CHUNK). Dynamo
+unrolls the inner loop for the static chunk size and fuses the block matmuls,
+trace, log, and divide across all iterations in the chunk. The Python loop reduces
+from L to L/tbptt iterations. The first CUDA call incurs a one-time Triton
+compilation cost (~1-5 min for chunk_size=128); subsequent calls are fast.
 """
 from __future__ import annotations
 import math
@@ -98,14 +106,60 @@ def _cplx_mm_dag_block(
     return _cplx_mm_block(Ar, Ai, Br.mT, -Bi.mT, cdtype)
 
 
+def _scan_chunk_impl(
+    Kr_chunk: torch.Tensor,   # (B, C, W, n, n) float32, contiguous
+    Ki_chunk: torch.Tensor,   # (B, C, W, n, n) float32, contiguous
+    rho_r: torch.Tensor,      # (B, n, n) float32
+    rho_i: torch.Tensor,      # (B, n, n) float32
+    eps: float,
+    decohere: bool,
+    cdtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Sequential scan over one TBPTT chunk. Returns (nll_chunk, rho_r_out, rho_i_out).
+
+    No .item() calls — all tensor arithmetic so torch.compile can fuse the
+    entire unrolled loop into one or a few Triton kernels per chunk.
+    """
+    C = Kr_chunk.shape[1]
+    nll_chunk = torch.zeros((), dtype=rho_r.dtype, device=rho_r.device)
+    for t in range(C):
+        Kr_x = Kr_chunk[:, t]   # (B, W, n, n) — slice, no gather kernel
+        Ki_x = Ki_chunk[:, t]
+        Krho_r, Krho_i = _cplx_mm_block(
+            Kr_x, Ki_x, rho_r.unsqueeze(1), rho_i.unsqueeze(1), cdtype)
+        E_r, E_i = _cplx_mm_dag_block(Krho_r, Krho_i, Kr_x, Ki_x, cdtype)
+        E_r = E_r.sum(1)   # (B, n, n)
+        E_i = E_i.sum(1)
+        p_t = E_r.diagonal(dim1=-2, dim2=-1).sum(-1).clamp_min(eps)  # (B,)
+        nll_chunk = nll_chunk - torch.log(p_t).sum()
+        rho_r = E_r / p_t[:, None, None]
+        rho_i = E_i / p_t[:, None, None]
+        if decohere:
+            diag = rho_r.diagonal(dim1=-2, dim2=-1)
+            rho_r = torch.diag_embed(diag)
+            rho_i = torch.zeros_like(rho_r)
+            rho_r = rho_r / diag.sum(-1).clamp_min(eps)[:, None, None]
+    return nll_chunk, rho_r, rho_i
+
+
+# Compiled once at module import (lazy: Triton compilation happens on first CUDA call).
+# dynamic=False: Dynamo guards on chunk_size and unrolls the inner loop into a single
+# monolithic graph per unique chunk_size — typically one for the main chunk (= tbptt)
+# and one for the optional partial last chunk. Specialises on bool decohere and dtype
+# cdtype automatically, producing at most a small set of cached compiled graphs.
+_SCAN_CHUNK = torch.compile(_scan_chunk_impl, fullgraph=True, dynamic=False)
+
+
 class QuantumChannelLM(nn.Module):
     def __init__(self, vocab_size: int, dim: int = 48, kraus: int = 4,
                  cdtype: torch.dtype = torch.complex64, init_scale: float = 1.0,
                  fast_kernels: bool = False,
                  compute_dtype: torch.dtype = torch.bfloat16):
         """
-        fast_kernels: replace per-token complex64 einsums with real 2×2-block bf16
-                      matmuls on CUDA (no-op on CPU; architecture unchanged).
+        fast_kernels: on CUDA, replaces per-token complex64 einsums with real
+                      2×2-block bf16 matmuls AND activates the compiled chunked
+                      scan (pre-gathered Kraus ops + torch.compile'd inner loop).
+                      No-op on CPU; architecture and numerics are unchanged.
         compute_dtype: dtype used for the block matmuls (default bfloat16).
         """
         super().__init__()
@@ -201,45 +255,56 @@ class QuantumChannelLM(nn.Module):
             rho_i = rho.imag.clone()
             cdtype = self.compute_dtype
 
-            for t in range(L):
-                tgt = tokens[:, t]            # (B,)
+            # Pre-gather all Kraus operators for the whole sequence at once.
+            # One batched index op instead of L per-token gather kernels.
+            Kr_seq = Kr_iso[tokens]   # (B, L, W, n, n)
+            Ki_seq = Ki_iso[tokens]
 
-                if return_probs:
+            if return_probs:
+                # Diagnostic path: needs per-step full-vocab Born readout.
+                # Use pre-gathered slices (no per-step gather) but skip compiled scan.
+                for t in range(L):
                     pall = torch.einsum('bij,xji->bx',
                                         torch.complex(rho_r, rho_i), M).real
                     pall = pall.clamp_min(eps)
                     prob_log.append(pall.detach() / pall.sum(-1, keepdim=True))
-
-                Kr_x = Kr_iso[tgt]            # (B, W, n, n)
-                Ki_x = Ki_iso[tgt]
-
-                # Krho = Kx @ rho  — one 2×2-block bf16 matmul
-                Krho_r, Krho_i = _cplx_mm_block(
-                    Kr_x, Ki_x,
-                    rho_r.unsqueeze(1), rho_i.unsqueeze(1),  # (B, 1, n, n)
-                    cdtype)                                   # → (B, W, n, n)
-
-                # E = sum_w Krho @ Kx†  — one 2×2-block bf16 matmul per W, summed
-                E_r, E_i = _cplx_mm_dag_block(Krho_r, Krho_i, Kr_x, Ki_x, cdtype)
-                E_r = E_r.sum(1)   # (B, n, n)
-                E_i = E_i.sum(1)
-
-                # p = Tr(E)  (imaginary part is zero for Hermitian E)
-                p_tgt = E_r.diagonal(dim1=-2, dim2=-1).sum(-1).clamp_min(eps)  # (B,)
-                nll_sum = nll_sum - torch.log(p_tgt).sum()
-
-                rho_r = E_r / p_tgt[:, None, None]
-                rho_i = E_i / p_tgt[:, None, None]
-
-                if decohere:
-                    diag = rho_r.diagonal(dim1=-2, dim2=-1)   # (B, n)
-                    rho_r = torch.diag_embed(diag)
-                    rho_i = torch.zeros_like(rho_r)
-                    rho_r = rho_r / diag.sum(-1).clamp_min(eps)[:, None, None]
-
-                if tbptt and (t + 1) % tbptt == 0:
-                    rho_r = rho_r.detach()
-                    rho_i = rho_i.detach()
+                    Kr_x = Kr_seq[:, t]   # (B, W, n, n) — slice, no gather
+                    Ki_x = Ki_seq[:, t]
+                    Krho_r, Krho_i = _cplx_mm_block(
+                        Kr_x, Ki_x,
+                        rho_r.unsqueeze(1), rho_i.unsqueeze(1), cdtype)
+                    E_r, E_i = _cplx_mm_dag_block(Krho_r, Krho_i, Kr_x, Ki_x, cdtype)
+                    E_r = E_r.sum(1); E_i = E_i.sum(1)
+                    p_tgt = E_r.diagonal(dim1=-2, dim2=-1).sum(-1).clamp_min(eps)
+                    nll_sum = nll_sum - torch.log(p_tgt).sum()
+                    rho_r = E_r / p_tgt[:, None, None]
+                    rho_i = E_i / p_tgt[:, None, None]
+                    if decohere:
+                        diag = rho_r.diagonal(dim1=-2, dim2=-1)
+                        rho_r = torch.diag_embed(diag)
+                        rho_i = torch.zeros_like(rho_r)
+                        rho_r = rho_r / diag.sum(-1).clamp_min(eps)[:, None, None]
+                    if tbptt and (t + 1) % tbptt == 0:
+                        rho_r = rho_r.detach()
+                        rho_i = rho_i.detach()
+            else:
+                # Compiled chunk scan path.
+                # chunk_size aligns with tbptt so detach falls at chunk boundaries.
+                chunk_size = tbptt if tbptt > 0 else L
+                for start in range(0, L, chunk_size):
+                    end = min(start + chunk_size, L)
+                    # .contiguous() required: Kr_seq[:, start:end] is a non-contiguous
+                    # view (slicing dim 1 of a 5-D tensor); block matmuls need contiguous.
+                    Kr_chunk = Kr_seq[:, start:end].contiguous()
+                    Ki_chunk = Ki_seq[:, start:end].contiguous()
+                    nll_chunk, rho_r, rho_i = _SCAN_CHUNK(
+                        Kr_chunk, Ki_chunk, rho_r, rho_i, eps, decohere, cdtype)
+                    # nll_sum + nll_chunk keeps the NLL gradient graph alive;
+                    # the state detach below only truncates the state gradient (TBPTT).
+                    nll_sum = nll_sum + nll_chunk
+                    if tbptt:
+                        rho_r = rho_r.detach()
+                        rho_i = rho_i.detach()
 
         else:
             # Original complex64 einsum path (CPU / debugging / no fast_kernels).
