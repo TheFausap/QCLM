@@ -138,6 +138,11 @@ def main():
 
     logf = open(os.path.join(args.out, f"{args.tag}_log.jsonl"), "w")
     cfg = vars(args).copy(); cfg.update(vocab_size=V, num_params=params, device=str(device))
+    # Drop keys that are irrelevant for the chosen source to keep the banner clean.
+    if args.source == "fineweb":
+        cfg.pop("local_path", None)
+    else:
+        cfg.pop("fineweb_dataset", None); cfg.pop("fineweb_name", None)
     logf.write(json.dumps({"type": "config", **cfg}) + "\n"); logf.flush()
     print("CONFIG:", json.dumps(cfg))
 
