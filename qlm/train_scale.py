@@ -94,7 +94,7 @@ def main():
     ap.add_argument("--threads", type=int, default=0)
     ap.add_argument("--eval_every", type=int, default=1000)
     ap.add_argument("--eval_batches", type=int, default=20)
-    ap.add_argument("--ckpt_every", type=int, default=2000)
+    ap.add_argument("--ckpt_every", type=int, default=500)
     ap.add_argument("--out", default=os.path.join(HERE, "artifacts"))
     ap.add_argument("--tag", default="qclm_scale")
     ap.add_argument("--seed", type=int, default=0)
@@ -146,45 +146,61 @@ def main():
     logf.write(json.dumps({"type": "config", **cfg}) + "\n"); logf.flush()
     print("CONFIG:", json.dumps(cfg))
 
+    def save_ckpt(label: str, extra: dict | None = None):
+        path = os.path.join(args.out, f"{args.tag}_{label}.pt")
+        payload = {"model": model.state_dict(), "opt": opt.state_dict(),
+                   "cfg": cfg, "step": step, "seen_tokens": seen_tok}
+        if extra:
+            payload.update(extra)
+        torch.save(payload, path)
+        return path
+
     model.train()
     t0 = time.time(); run_nll, run_tok = 0.0, 0; best = float("inf"); seen_tok = 0
-    for step in range(args.steps):
-        for pg in opt.param_groups:
-            pg["lr"] = lr_at(step)
-        opt.zero_grad(set_to_none=True)
-        acc_nll = 0.0
-        for _ in range(args.grad_accum):
-            seqs = next(stream).to(device)
-            out = model.forward(seqs, tbptt=args.tbptt)
-            (out["loss"] / args.grad_accum).backward()
-            acc_nll += out["nll_sum"].item(); run_tok += out["n_tokens"]; seen_tok += out["n_tokens"]
-        run_nll += acc_nll
-        gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
-        opt.step()
+    step = 0
+    try:
+        for step in range(args.steps):
+            for pg in opt.param_groups:
+                pg["lr"] = lr_at(step)
+            opt.zero_grad(set_to_none=True)
+            acc_nll = 0.0
+            for _ in range(args.grad_accum):
+                seqs = next(stream).to(device)
+                out = model.forward(seqs, tbptt=args.tbptt)
+                (out["loss"] / args.grad_accum).backward()
+                acc_nll += out["nll_sum"].item(); run_tok += out["n_tokens"]; seen_tok += out["n_tokens"]
+            run_nll += acc_nll
+            gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
+            opt.step()
 
-        if (step + 1) % 20 == 0:
-            tr_bits = (run_nll / run_tok) / LN2; run_nll, run_tok = 0.0, 0
-            tps = seen_tok / (time.time() - t0)
-            print(f"step {step+1:6d} | train {tr_bits:.3f} b/tok | lr {lr_at(step):.1e} | "
-                  f"gnorm {gnorm:.2f} | {tps:.0f} tok/s | seen {seen_tok/1e6:.1f}M")
-        if (step + 1) % args.eval_every == 0:
-            vb = evaluate(model, eval_batches, device, args.tbptt)
-            print(f"   >>> step {step+1}: VAL {vb:.3f} bits/token | {seen_tok/1e6:.1f}M tokens")
-            logf.write(json.dumps({"type": "eval", "step": step + 1, "val_bits": vb,
-                                   "seen_tokens": seen_tok, "time": time.time() - t0}) + "\n"); logf.flush()
-            try:
-                ids = model.generate(tok.encode("\n"), n_new=80, temperature=0.8, seed=1)
-                print("   SAMPLE:", repr(tok.decode(ids)[:200]))
-            except Exception as e:
-                print("   sample failed:", e)
-            if vb < best:
-                best = vb
-                torch.save({"model": model.state_dict(), "cfg": cfg, "tokenizer_path": args.tokenizer,
-                            "val_bits": vb, "step": step + 1},
-                           os.path.join(args.out, f"{args.tag}_best.pt"))
-        if (step + 1) % args.ckpt_every == 0:
-            torch.save({"model": model.state_dict(), "cfg": cfg, "step": step + 1},
-                       os.path.join(args.out, f"{args.tag}_last.pt"))
+            if (step + 1) % 20 == 0:
+                tr_bits = (run_nll / run_tok) / LN2; run_nll, run_tok = 0.0, 0
+                tps = seen_tok / (time.time() - t0)
+                print(f"step {step+1:6d} | train {tr_bits:.3f} b/tok | lr {lr_at(step):.1e} | "
+                      f"gnorm {gnorm:.2f} | {tps:.0f} tok/s | seen {seen_tok/1e6:.1f}M")
+            if (step + 1) % args.eval_every == 0:
+                vb = evaluate(model, eval_batches, device, args.tbptt)
+                print(f"   >>> step {step+1}: VAL {vb:.3f} bits/token | {seen_tok/1e6:.1f}M tokens")
+                logf.write(json.dumps({"type": "eval", "step": step + 1, "val_bits": vb,
+                                       "seen_tokens": seen_tok, "time": time.time() - t0}) + "\n"); logf.flush()
+                try:
+                    ids = model.generate(tok.encode("\n"), n_new=80, temperature=0.8, seed=1)
+                    print("   SAMPLE:", repr(tok.decode(ids)[:200]))
+                except Exception as e:
+                    print("   sample failed:", e)
+                if vb < best:
+                    best = vb
+                    save_ckpt("best", {"tokenizer_path": args.tokenizer, "val_bits": vb})
+            if (step + 1) % args.ckpt_every == 0:
+                save_ckpt("last")
+
+    except Exception as e:
+        path = save_ckpt("crash")
+        print(f"\n*** CRASH at step {step}: {e}")
+        print(f"*** Emergency checkpoint saved → {path}")
+        logf.write(json.dumps({"type": "crash", "step": step, "error": str(e),
+                               "seen_tokens": seen_tok}) + "\n"); logf.flush()
+        raise
 
     logf.write(json.dumps({"type": "final", "best_val_bits": best,
                            "wall_time": time.time() - t0, "seen_tokens": seen_tok}) + "\n")

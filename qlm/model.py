@@ -75,8 +75,21 @@ class _InvSqrtHermitian(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, G: torch.Tensor, eps: float) -> torch.Tensor:
+        n = G.shape[-1]
         G = 0.5 * (G + G.conj().mH)
-        evals, evecs = torch.linalg.eigh(G)
+        # Adaptive regularization: shift G by alpha*I to bound the condition number.
+        # alpha scales with the largest diagonal so it stays meaningful regardless of
+        # parameter scale, yet stays small enough not to distort the projection.
+        alpha = G.diagonal().real.abs().max().clamp(min=eps).item() * 1e-4
+        G_reg = G + alpha * torch.eye(n, dtype=G.dtype, device=G.device)
+        try:
+            evals, evecs = torch.linalg.eigh(G_reg)
+        except torch.linalg.LinAlgError:
+            # Extremely ill-conditioned G: fall back to much stronger regularization
+            # (identity-level shift) so training can continue rather than crash.
+            alpha2 = G.diagonal().real.abs().max().clamp(min=eps).item()
+            G_reg = G + alpha2 * torch.eye(n, dtype=G.dtype, device=G.device)
+            evals, evecs = torch.linalg.eigh(G_reg)
         s = evals.real.clamp(min=eps).sqrt()           # (n,) real sqrt-eigenvalues
         inv_sqrt = evecs @ torch.diag_embed((1.0 / s).to(evecs.dtype)) @ evecs.conj().mH
         ctx.save_for_backward(evecs, s)                # keep s real for Loewner math
