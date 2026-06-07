@@ -87,6 +87,8 @@ def main():
     ap.add_argument("--tbptt", type=int, default=128)
     ap.add_argument("--steps", type=int, default=50000)
     ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--wd", type=float, default=0.1,
+                    help="AdamW weight decay — keeps Kraus scales balanced → better G conditioning")
     ap.add_argument("--warmup", type=int, default=2000)
     ap.add_argument("--clip", type=float, default=1.0)
     # infra
@@ -130,7 +132,7 @@ def main():
     params = model.num_params()
     print(f"model params: {params/1e9:.3f}B  (dim={args.dim} kraus={args.kraus} V={V})")
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95),
-                            weight_decay=0.0)
+                            weight_decay=args.wd)
 
     def lr_at(step):
         if step < args.warmup:
@@ -190,6 +192,11 @@ def main():
                 acc_nll += out["nll_sum"].item(); run_tok += out["n_tokens"]; seen_tok += out["n_tokens"]
             run_nll += acc_nll
             gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
+            if torch.isnan(gnorm) or torch.isinf(gnorm):
+                print(f"step {step+1}: NaN/Inf gnorm — skipping optimizer step")
+                opt.zero_grad(set_to_none=True)
+                run_nll = float("nan"); run_tok = max(run_tok, 1)  # force nan into the log
+                continue
             opt.step()
 
             if (step + 1) % 20 == 0:

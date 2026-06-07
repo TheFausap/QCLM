@@ -56,8 +56,11 @@ compilation cost (~1-5 min for chunk_size=128); subsequent calls are fast.
 """
 from __future__ import annotations
 import math
+import warnings
 import torch
 import torch.nn as nn
+
+_SVD_FALLBACK_COUNT = 0  # counts how often the cusolver fallback fires
 
 
 def _inv_sqrt_hermitian(G: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -87,7 +90,15 @@ def _inv_sqrt_hermitian(G: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
 
     G_reg = G + alpha * I
     try:
-        U, S, _ = torch.linalg.svd(G_reg, full_matrices=False)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            U, S, _ = torch.linalg.svd(G_reg, full_matrices=False)
+        if caught:
+            global _SVD_FALLBACK_COUNT
+            _SVD_FALLBACK_COUNT += 1
+            if _SVD_FALLBACK_COUNT == 1:
+                print(f"[model] SVD cusolver fallback (G ill-conditioned); "
+                      f"further occurrences are silenced. max_diag={max_diag:.3e}")
     except torch.linalg.LinAlgError:
         alpha = max_diag                      # identity-scale shift
         G_reg = G + alpha * I
@@ -279,7 +290,9 @@ class QuantumChannelLM(nn.Module):
 
         rho = self.initial_rho(B, decohere=decohere)  # (B, n, n)
 
-        eps = 1e-12
+        # 1e-6 clamp: limits per-step gradient amplification through rho=E/p to 1e6 instead of
+        # 1e12, preventing bfloat16 overflow in the compiled backward when K_iso is inaccurate.
+        eps = 1e-6
         nll_sum = tokens.new_zeros((), dtype=self.rdtype)
         n_tokens = B * L
         prob_log = [] if return_probs else None
@@ -389,7 +402,7 @@ class QuantumChannelLM(nn.Module):
         K = self.kraus_operators()
         M = self.povm(K)
         rho = self.initial_rho(1, decohere=decohere)               # (1, n, n)
-        eps = 1e-12
+        eps = 1e-6
         out_ids: list[int] = []
 
         use_fast = self.fast_kernels and rho.device.type == 'cuda'
