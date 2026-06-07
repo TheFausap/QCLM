@@ -60,39 +60,64 @@ import torch
 import torch.nn as nn
 
 
+def _eigh_via_svd(G_reg: torch.Tensor, eps: float):
+    """Return (evecs, s) for a Hermitian PSD G_reg using SVD.
+
+    For Hermitian PSD matrices the left singular vectors equal the eigenvectors
+    and the singular values equal the eigenvalues.  torch.linalg.svd uses
+    zgesdd (divide-and-conquer bidiagonalization) which is fundamentally more
+    robust for repeated / near-zero eigenvalues than the zheevd routine called
+    by torch.linalg.eigh.  The Loewner backward is unchanged.
+    """
+    U, S, _ = torch.linalg.svd(G_reg, full_matrices=False)
+    return U, S.real.clamp(min=eps).sqrt()   # evecs (complex), s (real)
+
+
+def _eigh_numpy_fallback(G_reg: torch.Tensor, eps: float):
+    """Last-resort CPU/numpy eigendecomposition; tiny (n×n) so always fast."""
+    import numpy as np
+    dev = G_reg.device
+    G_np = G_reg.detach().cpu().numpy()
+    evals_np, evecs_np = np.linalg.eigh(G_np)
+    s = torch.tensor(evals_np.real, dtype=torch.float32, device=dev).clamp(min=eps).sqrt()
+    evecs = torch.tensor(evecs_np, dtype=G_reg.dtype, device=dev)
+    return evecs, s
+
+
 class _InvSqrtHermitian(torch.autograd.Function):
     """Differentiable G^{-1/2} for Hermitian PSD G.
 
-    PyTorch's built-in eigh backward raises an error for complex matrices when
-    eigenvalues are degenerate (which happens naturally during training). The
-    function G → G^{-1/2} is phase-invariant, so its gradient is always
-    well-defined. We implement the backward via the Loewner matrix formula:
+    Three-layer fallback stack in the forward so training never crashes:
+      1. SVD (zgesdd) — handles repeated singular values; avoids zheevd failures.
+      2. SVD with a much stronger regularization shift.
+      3. numpy.linalg.eigh on CPU — deterministic, always converges.
 
-        F_ij = -1 / (s_i * s_j * (s_i + s_j)),  s_i = sqrt(lambda_i)
-
-    This formula is regular even when s_i = s_j, bypassing the eigh check.
+    The Loewner matrix backward is well-defined for any s_i, including
+    s_i = s_j (degenerate case gives F_ij = -1/(2 s_i³), same as f'(s_i²)).
     """
 
     @staticmethod
     def forward(ctx, G: torch.Tensor, eps: float) -> torch.Tensor:
         n = G.shape[-1]
         G = 0.5 * (G + G.conj().mH)
-        # Adaptive regularization: shift G by alpha*I to bound the condition number.
-        # alpha scales with the largest diagonal so it stays meaningful regardless of
-        # parameter scale, yet stays small enough not to distort the projection.
-        alpha = G.diagonal().real.abs().max().clamp(min=eps).item() * 1e-4
-        G_reg = G + alpha * torch.eye(n, dtype=G.dtype, device=G.device)
+        I = torch.eye(n, dtype=G.dtype, device=G.device)
+        max_diag = G.diagonal().real.abs().max().clamp(min=eps).item()
+
+        # Level-1: mild regularisation (condition number ≤ ~1e4 for float32)
+        G_reg = G + max_diag * 1e-4 * I
         try:
-            evals, evecs = torch.linalg.eigh(G_reg)
+            evecs, s = _eigh_via_svd(G_reg, eps)
         except torch.linalg.LinAlgError:
-            # Extremely ill-conditioned G: fall back to much stronger regularization
-            # (identity-level shift) so training can continue rather than crash.
-            alpha2 = G.diagonal().real.abs().max().clamp(min=eps).item()
-            G_reg = G + alpha2 * torch.eye(n, dtype=G.dtype, device=G.device)
-            evals, evecs = torch.linalg.eigh(G_reg)
-        s = evals.real.clamp(min=eps).sqrt()           # (n,) real sqrt-eigenvalues
+            # Level-2: identity-scale shift (still informative but very safe)
+            G_reg = G + max_diag * I
+            try:
+                evecs, s = _eigh_via_svd(G_reg, eps)
+            except torch.linalg.LinAlgError:
+                # Level-3: numpy on CPU — cannot fail for a finite matrix
+                evecs, s = _eigh_numpy_fallback(G_reg, eps)
+
         inv_sqrt = evecs @ torch.diag_embed((1.0 / s).to(evecs.dtype)) @ evecs.conj().mH
-        ctx.save_for_backward(evecs, s)                # keep s real for Loewner math
+        ctx.save_for_backward(evecs, s)          # s stays real for Loewner math
         return inv_sqrt
 
     @staticmethod

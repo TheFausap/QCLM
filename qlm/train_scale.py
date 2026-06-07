@@ -98,6 +98,8 @@ def main():
     ap.add_argument("--out", default=os.path.join(HERE, "artifacts"))
     ap.add_argument("--tag", default="qclm_scale")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--resume", default="", metavar="CKPT",
+                    help="path to a _crash / _last checkpoint to resume from")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -136,14 +138,31 @@ def main():
         prog = (step - args.warmup) / max(1, args.steps - args.warmup)
         return args.lr * (0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * min(prog, 1.0))))
 
-    logf = open(os.path.join(args.out, f"{args.tag}_log.jsonl"), "w")
+    # ── Resume from checkpoint ────────────────────────────────────────────────
+    start_step = 0; seen_tok = 0; best = float("inf")
+    if args.resume:
+        if not os.path.exists(args.resume):
+            raise FileNotFoundError(f"--resume: checkpoint not found: {args.resume}")
+        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model"])
+        opt.load_state_dict(ckpt["opt"])
+        start_step = ckpt.get("step", 0)       # re-run the step that crashed
+        seen_tok   = ckpt.get("seen_tokens", 0)
+        best       = ckpt.get("val_bits", float("inf"))
+        print(f"resumed from {args.resume}")
+        print(f"  start_step={start_step}  seen={seen_tok/1e6:.1f}M tok  best={best:.3f}")
+
     cfg = vars(args).copy(); cfg.update(vocab_size=V, num_params=params, device=str(device))
     # Drop keys that are irrelevant for the chosen source to keep the banner clean.
     if args.source == "fineweb":
         cfg.pop("local_path", None)
     else:
         cfg.pop("fineweb_dataset", None); cfg.pop("fineweb_name", None)
-    logf.write(json.dumps({"type": "config", **cfg}) + "\n"); logf.flush()
+    # Append to the existing log when resuming so history is preserved.
+    log_path = os.path.join(args.out, f"{args.tag}_log.jsonl")
+    logf = open(log_path, "a" if args.resume else "w")
+    logf.write(json.dumps({"type": "config", "resumed_from": args.resume, **cfg}) + "\n")
+    logf.flush()
     print("CONFIG:", json.dumps(cfg))
 
     def save_ckpt(label: str, extra: dict | None = None):
@@ -156,10 +175,10 @@ def main():
         return path
 
     model.train()
-    t0 = time.time(); run_nll, run_tok = 0.0, 0; best = float("inf"); seen_tok = 0
-    step = 0
+    t0 = time.time(); run_nll, run_tok = 0.0, 0
+    step = start_step
     try:
-        for step in range(args.steps):
+        for step in range(start_step, args.steps):
             for pg in opt.param_groups:
                 pg["lr"] = lr_at(step)
             opt.zero_grad(set_to_none=True)
