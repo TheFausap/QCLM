@@ -87,8 +87,9 @@ def main():
     ap.add_argument("--tbptt", type=int, default=128)
     ap.add_argument("--steps", type=int, default=50000)
     ap.add_argument("--lr", type=float, default=1e-3)
-    ap.add_argument("--wd", type=float, default=0.1,
-                    help="AdamW weight decay — keeps Kraus scales balanced → better G conditioning")
+    ap.add_argument("--wd", type=float, default=0.0,
+                    help="AdamW weight decay (0 = off; rare-token operators get no gradient so "
+                         "positive wd drives them to zero and worsens G conditioning)")
     ap.add_argument("--warmup", type=int, default=2000)
     ap.add_argument("--clip", type=float, default=1.0)
     # infra

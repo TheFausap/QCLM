@@ -237,19 +237,23 @@ class QuantumChannelLM(nn.Module):
 
         Enforces sum_{x,w} K_{x,w}^dag K_{x,w} = I via polar projection.
 
-        G^{-1/2} is computed under torch.no_grad() (straight-through estimator).
-        Differentiating through the projection when G is ill-conditioned amplifies
-        gradients by O(1/s_min^3) ≈ 5e8, causing NaN. The STE drops that path;
-        the loss gradient still reaches Kr/Ki through Vmat @ G_inv_sqrt where
-        G_inv_sqrt is treated as a fixed matrix by autograd.
+        True straight-through estimator: forward computes the polar projection
+        Vmat_iso = Vmat @ G^{-1/2}, but the backward treats the projection as the
+        identity map (grad_Vmat = grad_Vmat_iso).  This avoids two failure modes:
+          1. Differentiating G^{-1/2} when G is ill-conditioned amplifies gradients
+             by O(1/s_min^3), causing NaN (the original Loewner-matrix issue).
+          2. Using Vmat @ G_inv_sqrt with G_inv_sqrt detached rotates grad by G^{-1/2}
+             (eigenvalues ~1/256), shrinking gnorm ~300× and distorting its direction.
         """
         K = torch.complex(self.Kr, self.Ki)  # (V, W, n, n)
         V, W, n, _ = K.shape
         Vmat = K.reshape(V * W * n, n)
         with torch.no_grad():
-            G = Vmat.mH @ Vmat                               # (n, n) — no grad needed
+            G = Vmat.mH @ Vmat
             G_inv_sqrt = _inv_sqrt_hermitian(G)
-        Vmat_iso = Vmat @ G_inv_sqrt                         # gradient flows through Vmat only
+            Vmat_iso_val = Vmat @ G_inv_sqrt  # projected value, no gradient tracked
+        # True STE: value = projected, backward = identity (Vmat - Vmat.detach() is 0 + grad)
+        Vmat_iso = Vmat_iso_val + (Vmat - Vmat.detach())
         K_iso = Vmat_iso.reshape(V, W, n, n)
         return K_iso
 
