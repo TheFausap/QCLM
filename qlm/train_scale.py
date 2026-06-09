@@ -204,6 +204,10 @@ def main():
                 tps = seen_tok / (time.time() - t0)
                 print(f"step {step+1:6d} | train {tr_bits:.3f} b/tok | lr {lr_at(step):.1e} | "
                       f"gnorm {gnorm:.2f} | {tps:.0f} tok/s | seen {seen_tok/1e6:.1f}M")
+                logf.write(json.dumps({"type": "train", "step": step + 1,
+                                       "train_bits": tr_bits, "gnorm": gnorm.item(),
+                                       "lr": lr_at(step), "tok_per_s": tps,
+                                       "seen_tokens": seen_tok}) + "\n"); logf.flush()
             if (step + 1) % args.eval_every == 0:
                 vb = evaluate(model, eval_batches, device, args.tbptt)
                 print(f"   >>> step {step+1}: VAL {vb:.3f} bits/token | {seen_tok/1e6:.1f}M tokens")
