@@ -63,57 +63,124 @@ import torch.nn as nn
 _SVD_FALLBACK_COUNT = 0  # counts how often the cusolver fallback fires
 
 
-def _inv_sqrt_hermitian(G: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    """G^{-1/2} for a Hermitian PSD matrix.
+def _svd_hermitian(G: torch.Tensor, eps: float = 1e-6):
+    """SVD of a Hermitian PSD matrix with three-layer fallback.
 
-    Three-layer fallback so the forward never crashes:
-      1. SVD (zgesdd) with mild regularisation — more robust than zheevd for
-         repeated / near-zero eigenvalues.
-      2. SVD with identity-scale regularisation.
-      3. numpy.linalg.eigh on CPU — always converges for finite matrices.
-
-    The regularisation shift is corrected before computing the inverse square
-    root so the result approximates the true G^{-1/2} rather than (G+αI)^{-1/2}.
-    This keeps Σ M_x ≈ I and prevents the density-matrix trace from drifting.
-
-    Call this function inside torch.no_grad() (straight-through estimator).
-    Differentiating through G^{-1/2} when G is ill-conditioned produces a
-    Loewner matrix with entries O(1/s_min^3) ≈ 5×10^8, causing NaN gradients.
-    The STE drops that path; the loss gradient still reaches Kr/Ki through the
-    direct Vmat @ G_inv_sqrt route where G_inv_sqrt is treated as a constant.
+    Returns (U, evals) where G ≈ U @ diag(evals) @ U†, evals clamped to ≥ eps.
+    The regularisation shift α is subtracted before clamping so the result
+    approximates the true eigenvalues rather than those of (G + αI).
     """
     n = G.shape[-1]
     G = 0.5 * (G + G.mH)
     I = torch.eye(n, dtype=G.dtype, device=G.device)
     max_diag = G.diagonal().real.abs().max().clamp(min=eps).item()
     alpha = max_diag * 1e-4
-
     G_reg = G + alpha * I
+
+    global _SVD_FALLBACK_COUNT
     try:
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             U, S, _ = torch.linalg.svd(G_reg, full_matrices=False)
         if caught:
-            global _SVD_FALLBACK_COUNT
             _SVD_FALLBACK_COUNT += 1
             if _SVD_FALLBACK_COUNT == 1:
                 print(f"[model] SVD cusolver fallback (G ill-conditioned); "
                       f"further occurrences are silenced. max_diag={max_diag:.3e}")
     except torch.linalg.LinAlgError:
-        alpha = max_diag                      # identity-scale shift
+        alpha = max_diag
         G_reg = G + alpha * I
         try:
             U, S, _ = torch.linalg.svd(G_reg, full_matrices=False)
         except torch.linalg.LinAlgError:
-            import numpy as np               # CPU fallback — never fails
+            import numpy as np
             ev_np, U_np = np.linalg.eigh(G_reg.detach().cpu().numpy())
             S = torch.tensor(ev_np.real, dtype=torch.float32, device=G.device)
             U = torch.tensor(U_np, dtype=G.dtype, device=G.device)
 
-    # Subtract the regularisation shift so we approximate G^{-1/2}, not (G+αI)^{-1/2}
     evals = (S.real - alpha).clamp(min=eps)
+    return U, evals
+
+
+def _inv_sqrt_hermitian(G: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """G^{-1/2} with no gradient — for use in __init__ and reproject_() only."""
+    U, evals = _svd_hermitian(G, eps)
     s = evals.sqrt()
     return U @ torch.diag_embed((1.0 / s).to(U.dtype)) @ U.conj().mH
+
+
+class _KrausProjection(torch.autograd.Function):
+    """K_iso = Vmat @ G^{-1/2},  G = Vmat†Vmat — with clipped Loewner backward.
+
+    Why the full Loewner backward (not STE / reproject):
+    ─────────────────────────────────────────────────────
+    The Loewner formula is the Riemannian gradient of the projection onto the
+    Stiefel manifold.  It gives the component of grad_K that is tangential to
+    the constraint surface, so the projected gradient step is a full-size move
+    along the manifold.
+
+    Both STE variants fail:
+      • STE with G_inv_sqrt detached: grad_Vmat = grad_K_iso @ G^{-1/2}, which
+        shrinks the effective step in K_iso space by ~1/256 (eigenvalue scale).
+      • True STE (identity backward): grad_Vmat = grad_K_iso, but the very next
+        forward call re-projects K, cancelling most of the optimizer update
+        (δK_iso ≈ δKr @ G^{-1/2} ≈ δKr / 256).
+      • reproject_() after opt.step(): K_iso ≈ Kr directly, no 1/256 shrinkage,
+        but Adam lr is comparable to K_iso entry scale (both ~2.5e-4 for 2B
+        params), so a single step is a 100% perturbation — unstable.
+
+    Clipping the Loewner matrix entries at ±max_loewner prevents NaN when G has
+    near-zero eigenvalues (entries would otherwise blow up as 1/s^{3/2}).  The
+    original runs got to 7.7 bits/tok before crashing at step ~380 when G first
+    became ill-conditioned; clipping makes that safe.
+    """
+
+    @staticmethod
+    def forward(ctx, K: torch.Tensor, eps: float, max_loewner: float) -> torch.Tensor:
+        V, W, n, _ = K.shape
+        Vmat = K.reshape(V * W * n, n)
+        U, evals = _svd_hermitian(Vmat.mH @ Vmat, eps)
+        s = evals.sqrt()
+        G_inv_sqrt = U @ torch.diag_embed((1.0 / s).to(U.dtype)) @ U.conj().mH
+        K_iso = (Vmat @ G_inv_sqrt).reshape(V, W, n, n)
+        ctx.save_for_backward(Vmat.detach(), U, evals, G_inv_sqrt.detach())
+        ctx.shape = (V, W, n)
+        ctx.max_loewner = max_loewner
+        return K_iso
+
+    @staticmethod
+    def backward(ctx, grad_K_iso: torch.Tensor):
+        Vmat, U, evals, G_inv_sqrt = ctx.saved_tensors
+        V, W, n = ctx.shape
+
+        grad_flat = grad_K_iso.reshape(V * W * n, n).to(Vmat.dtype)
+
+        # ── Direct path: K_iso = Vmat @ G_inv_sqrt ────────────────────────────
+        # grad_Vmat += grad_flat @ G_inv_sqrt†  (G_inv_sqrt is Hermitian)
+        grad_Vmat = grad_flat @ G_inv_sqrt
+
+        # ── G path: G = Vmat†Vmat → G_inv_sqrt → K_iso = Vmat @ G_inv_sqrt ───
+        # Incoming gradient to G_inv_sqrt: P = Vmat† grad_flat  (n × n)
+        P = Vmat.conj().mH @ grad_flat   # (n, n)
+
+        # Loewner matrix for f(s) = 1/sqrt(s):
+        #   L_ij = (f(si) − f(sj)) / (si − sj)  →  −1 / (√si · √sj · (√si + √sj))
+        #   diagonal limit  L_ii = f′(si) = −1 / (2 · si^{3/2})
+        sqrt_s = evals.float().sqrt()                        # (n,)
+        si = sqrt_s.unsqueeze(-1)                            # (n, 1)
+        sj = sqrt_s.unsqueeze(-2)                            # (1, n)
+        # Both diagonal and off-diagonal share the same closed form:
+        L = (-1.0 / (si * sj * (si + sj)).clamp(min=1e-10)).clamp(min=-ctx.max_loewner)
+
+        # grad_G = U (L * sym(U† P U)) U†
+        M = U.conj().mH @ P @ U                             # (n, n)
+        M_sym = 0.5 * (M + M.conj().mH)
+        grad_G = U @ (L.to(U.dtype) * M_sym) @ U.conj().mH  # (n, n)
+
+        # Backward through G = Vmat†Vmat:  grad_Vmat += Vmat (grad_G + grad_G†)
+        grad_Vmat = grad_Vmat + Vmat @ (grad_G + grad_G.conj().mH)
+
+        return grad_Vmat.reshape(V, W, n, n), None, None
 
 
 def _cplx_mm_block(
@@ -241,30 +308,15 @@ class QuantumChannelLM(nn.Module):
 
     # ----- constrained operators -------------------------------------------------
     def kraus_operators(self) -> torch.Tensor:
-        """Return K_iso = complex(Kr, Ki) directly.
+        """Return K_iso = Vmat @ G^{-1/2}, shape (V, W, n, n) complex.
 
-        Kr and Ki are kept on the isometry manifold (sum_{x,w} K†K = I) by calling
-        model.reproject_() after every opt.step() in the training loop.  The gradient
-        of the loss w.r.t. Kr/Ki is therefore the correct Euclidean gradient in K_iso
-        space — no STE distortion and no G^{-1/2} shrinkage of the effective step.
-        """
-        return torch.complex(self.Kr, self.Ki)
-
-    @torch.no_grad()
-    def reproject_(self) -> None:
-        """Project Kr, Ki back onto the isometry manifold (retraction step).
-
-        Called after opt.step() in the training loop.  Because the optimizer step
-        moves K slightly off the manifold, this is a small O(lr) correction that
-        leaves Adam's accumulated moments consistent with the current parameters.
+        Uses _KrausProjection — a custom autograd.Function with the clipped
+        Loewner backward — so the gradient reaching Kr/Ki is the Riemannian
+        gradient on the Stiefel manifold, not a shrunken or distorted STE proxy.
+        See _KrausProjection docstring for the full analysis.
         """
         K = torch.complex(self.Kr, self.Ki)
-        V, W, n, _ = K.shape
-        Vmat = K.reshape(V * W * n, n)
-        G_inv_sqrt = _inv_sqrt_hermitian(Vmat.mH @ Vmat)
-        K_iso = (Vmat @ G_inv_sqrt).reshape(V, W, n, n)
-        self.Kr.copy_(K_iso.real)
-        self.Ki.copy_(K_iso.imag)
+        return _KrausProjection.apply(K, 1e-6, 1e4)
 
     def povm(self, K: torch.Tensor) -> torch.Tensor:
         """POVM elements M_x = sum_w K_{x,w}^dag K_{x,w}; shape (V, n, n) complex."""

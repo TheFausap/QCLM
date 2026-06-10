@@ -148,14 +148,7 @@ def main():
             raise FileNotFoundError(f"--resume: checkpoint not found: {args.resume}")
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model"])
-        # Re-project onto the isometry manifold and reset Adam moments.
-        # Old moments tracked STE gradients for a non-manifold parameterisation;
-        # they are stale and would pull in the wrong direction.
-        model.reproject_()
         opt.load_state_dict(ckpt["opt"])
-        for group in opt.param_groups:
-            for p in group["params"]:
-                opt.state[p] = {}
         start_step = ckpt.get("step", 0)
         seen_tok   = ckpt.get("seen_tokens", 0)
         best       = ckpt.get("val_bits", float("inf"))
@@ -206,7 +199,6 @@ def main():
                 run_nll = float("nan"); run_tok = max(run_tok, 1)  # force nan into the log
                 continue
             opt.step()
-            model.reproject_()  # retract K onto the isometry manifold after parameter update
 
             if (step + 1) % 20 == 0:
                 tr_bits = (run_nll / run_tok) / LN2; run_nll, run_tok = 0.0, 0
