@@ -103,6 +103,11 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--resume", default="", metavar="CKPT",
                     help="path to a _crash / _last checkpoint to resume from")
+    ap.add_argument("--keep_opt", action="store_true",
+                    help="also load optimizer state on --resume. ONLY safe if the "
+                         "checkpoint was saved by this exact code version: Adam moments "
+                         "are calibrated to a specific backward, and load_state_dict "
+                         "silently restores the OLD hyperparameters (e.g. weight_decay).")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -148,7 +153,23 @@ def main():
             raise FileNotFoundError(f"--resume: checkpoint not found: {args.resume}")
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model"])
-        opt.load_state_dict(ckpt["opt"])
+        # Re-normalise the loaded parametrisation onto the isometry manifold.
+        # This does NOT change the model (forward projects anyway), but makes
+        # G ~= I so the Loewner backward starts well-scaled and well-conditioned.
+        model.reproject_()
+        if args.keep_opt:
+            old_wd = ckpt["opt"]["param_groups"][0].get("weight_decay", None)
+            opt.load_state_dict(ckpt["opt"])
+            # load_state_dict restored the checkpoint's hyperparams; the training
+            # loop only overrides lr, so re-assert the CLI values here. (A stale
+            # weight_decay from an old run would silently come back otherwise.)
+            for pg in opt.param_groups:
+                pg["weight_decay"] = args.wd
+                pg["betas"] = (0.9, 0.95)
+            print(f"  loaded optimizer state (ckpt wd={old_wd} -> using wd={args.wd})")
+        else:
+            print("  fresh optimizer state (stale Adam moments discarded; "
+                  "pass --keep_opt only if the ckpt was saved by this code version)")
         start_step = ckpt.get("step", 0)
         seen_tok   = ckpt.get("seen_tokens", 0)
         best       = ckpt.get("val_bits", float("inf"))
@@ -179,6 +200,7 @@ def main():
 
     model.train()
     t0 = time.time(); run_nll, run_tok = 0.0, 0
+    tok0 = seen_tok  # tokens seen before this process started (for correct tok/s)
     step = start_step
     try:
         for step in range(start_step, args.steps):
@@ -202,7 +224,7 @@ def main():
 
             if (step + 1) % 20 == 0:
                 tr_bits = (run_nll / run_tok) / LN2; run_nll, run_tok = 0.0, 0
-                tps = seen_tok / (time.time() - t0)
+                tps = (seen_tok - tok0) / (time.time() - t0)
                 print(f"step {step+1:6d} | train {tr_bits:.3f} b/tok | lr {lr_at(step):.1e} | "
                       f"gnorm {gnorm:.2f} | {tps:.0f} tok/s | seen {seen_tok/1e6:.1f}M")
                 logf.write(json.dumps({"type": "train", "step": step + 1,

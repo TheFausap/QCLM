@@ -289,8 +289,10 @@ class QuantumChannelLM(nn.Module):
         n = dim
         W = kraus
         # Kraus parameters stored as real/imag parts of K_iso; initialised ON the
-        # isometry manifold (sum_{x,w} K†K = I) so kraus_operators() needs no projection.
-        # Maintained on-manifold by calling model.reproject_() after each opt.step().
+        # isometry manifold (sum_{x,w} K†K = I). kraus_operators() re-projects every
+        # forward (with the Loewner backward), so staying exactly on-manifold is not
+        # required; reproject_() exists to re-normalise the parametrisation (e.g.
+        # after loading a checkpoint produced by older code).
         scale = init_scale / math.sqrt(V * W * n)
         K_raw = torch.complex(
             torch.randn(V, W, n, n, dtype=rdtype) * scale,
@@ -317,6 +319,24 @@ class QuantumChannelLM(nn.Module):
         """
         K = torch.complex(self.Kr, self.Ki)
         return _KrausProjection.apply(K, 1e-6, 1e4)
+
+    @torch.no_grad()
+    def reproject_(self) -> None:
+        """Snap Kr/Ki onto the isometry manifold. Does NOT change the model.
+
+        kraus_operators() projects in the forward pass anyway, so the model's
+        predictions are identical before/after; this only normalises the
+        parametrisation so that G = Vmat†Vmat ≈ I. That keeps the Loewner
+        backward well-conditioned and the gradient scale sane. Call it after
+        loading a checkpoint saved by an older code version (free/off-manifold
+        parametrisation, or weights shrunk by weight decay).
+        """
+        K = torch.complex(self.Kr, self.Ki)
+        V, W, n, _ = K.shape
+        Vmat = K.reshape(V * W * n, n)
+        K_iso = (Vmat @ _inv_sqrt_hermitian(Vmat.mH @ Vmat)).reshape(V, W, n, n)
+        self.Kr.copy_(K_iso.real)
+        self.Ki.copy_(K_iso.imag)
 
     def povm(self, K: torch.Tensor) -> torch.Tensor:
         """POVM elements M_x = sum_w K_{x,w}^dag K_{x,w}; shape (V, n, n) complex."""
