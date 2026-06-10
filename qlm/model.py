@@ -106,7 +106,7 @@ def _inv_sqrt_hermitian(G: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     """G^{-1/2} with no gradient — for use in __init__ and reproject_() only."""
     U, evals = _svd_hermitian(G, eps)
     s = evals.sqrt()
-    return U @ torch.diag_embed((1.0 / s).to(U.dtype)) @ U.conj().mH
+    return U @ torch.diag_embed((1.0 / s).to(U.dtype)) @ U.mH
 
 
 class _KrausProjection(torch.autograd.Function):
@@ -141,7 +141,7 @@ class _KrausProjection(torch.autograd.Function):
         Vmat = K.reshape(V * W * n, n)
         U, evals = _svd_hermitian(Vmat.mH @ Vmat, eps)
         s = evals.sqrt()
-        G_inv_sqrt = U @ torch.diag_embed((1.0 / s).to(U.dtype)) @ U.conj().mH
+        G_inv_sqrt = U @ torch.diag_embed((1.0 / s).to(U.dtype)) @ U.mH
         K_iso = (Vmat @ G_inv_sqrt).reshape(V, W, n, n)
         ctx.save_for_backward(Vmat.detach(), U, evals, G_inv_sqrt.detach())
         ctx.shape = (V, W, n)
@@ -161,7 +161,7 @@ class _KrausProjection(torch.autograd.Function):
 
         # ── G path: G = Vmat†Vmat → G_inv_sqrt → K_iso = Vmat @ G_inv_sqrt ───
         # Incoming gradient to G_inv_sqrt: P = Vmat† grad_flat  (n × n)
-        P = Vmat.conj().mH @ grad_flat   # (n, n)
+        P = Vmat.mH @ grad_flat   # (n, n)
 
         # Loewner matrix for f(s) = 1/sqrt(s):
         #   L_ij = (f(si) − f(sj)) / (si − sj)  →  −1 / (√si · √sj · (√si + √sj))
@@ -173,12 +173,12 @@ class _KrausProjection(torch.autograd.Function):
         L = (-1.0 / (si * sj * (si + sj)).clamp(min=1e-10)).clamp(min=-ctx.max_loewner)
 
         # grad_G = U (L * sym(U† P U)) U†
-        M = U.conj().mH @ P @ U                             # (n, n)
-        M_sym = 0.5 * (M + M.conj().mH)
-        grad_G = U @ (L.to(U.dtype) * M_sym) @ U.conj().mH  # (n, n)
+        M = U.mH @ P @ U                             # (n, n)
+        M_sym = 0.5 * (M + M.mH)
+        grad_G = U @ (L.to(U.dtype) * M_sym) @ U.mH  # (n, n)
 
         # Backward through G = Vmat†Vmat:  grad_Vmat += Vmat (grad_G + grad_G†)
-        grad_Vmat = grad_Vmat + Vmat @ (grad_G + grad_G.conj().mH)
+        grad_Vmat = grad_Vmat + Vmat @ (grad_G + grad_G.mH)
 
         return grad_Vmat.reshape(V, W, n, n), None, None
 
