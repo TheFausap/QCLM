@@ -221,11 +221,19 @@ class QuantumChannelLM(nn.Module):
         V = vocab_size
         n = dim
         W = kraus
-        # Free (unconstrained) Kraus parameters, stored as real/imag pairs.
-        # Shape (V, W, n, n). Projected to satisfy the isometry constraint on the fly.
+        # Kraus parameters stored as real/imag parts of K_iso; initialised ON the
+        # isometry manifold (sum_{x,w} K†K = I) so kraus_operators() needs no projection.
+        # Maintained on-manifold by calling model.reproject_() after each opt.step().
         scale = init_scale / math.sqrt(V * W * n)
-        self.Kr = nn.Parameter(torch.randn(V, W, n, n, dtype=rdtype) * scale)
-        self.Ki = nn.Parameter(torch.randn(V, W, n, n, dtype=rdtype) * scale)
+        K_raw = torch.complex(
+            torch.randn(V, W, n, n, dtype=rdtype) * scale,
+            torch.randn(V, W, n, n, dtype=rdtype) * scale,
+        )
+        with torch.no_grad():
+            Vm = K_raw.reshape(V * W * n, n)
+            K_iso_init = (Vm @ _inv_sqrt_hermitian(Vm.mH @ Vm)).reshape(V, W, n, n)
+        self.Kr = nn.Parameter(K_iso_init.real.contiguous())
+        self.Ki = nn.Parameter(K_iso_init.imag.contiguous())
 
         # Learned initial pure state |psi0>.
         self.psi0_r = nn.Parameter(torch.randn(n, dtype=rdtype) / math.sqrt(n))
@@ -233,29 +241,30 @@ class QuantumChannelLM(nn.Module):
 
     # ----- constrained operators -------------------------------------------------
     def kraus_operators(self) -> torch.Tensor:
-        """Return isometry-projected Kraus operators K of shape (V, W, n, n) complex.
+        """Return K_iso = complex(Kr, Ki) directly.
 
-        Enforces sum_{x,w} K_{x,w}^dag K_{x,w} = I via polar projection.
-
-        True straight-through estimator: forward computes the polar projection
-        Vmat_iso = Vmat @ G^{-1/2}, but the backward treats the projection as the
-        identity map (grad_Vmat = grad_Vmat_iso).  This avoids two failure modes:
-          1. Differentiating G^{-1/2} when G is ill-conditioned amplifies gradients
-             by O(1/s_min^3), causing NaN (the original Loewner-matrix issue).
-          2. Using Vmat @ G_inv_sqrt with G_inv_sqrt detached rotates grad by G^{-1/2}
-             (eigenvalues ~1/256), shrinking gnorm ~300× and distorting its direction.
+        Kr and Ki are kept on the isometry manifold (sum_{x,w} K†K = I) by calling
+        model.reproject_() after every opt.step() in the training loop.  The gradient
+        of the loss w.r.t. Kr/Ki is therefore the correct Euclidean gradient in K_iso
+        space — no STE distortion and no G^{-1/2} shrinkage of the effective step.
         """
-        K = torch.complex(self.Kr, self.Ki)  # (V, W, n, n)
+        return torch.complex(self.Kr, self.Ki)
+
+    @torch.no_grad()
+    def reproject_(self) -> None:
+        """Project Kr, Ki back onto the isometry manifold (retraction step).
+
+        Called after opt.step() in the training loop.  Because the optimizer step
+        moves K slightly off the manifold, this is a small O(lr) correction that
+        leaves Adam's accumulated moments consistent with the current parameters.
+        """
+        K = torch.complex(self.Kr, self.Ki)
         V, W, n, _ = K.shape
         Vmat = K.reshape(V * W * n, n)
-        with torch.no_grad():
-            G = Vmat.mH @ Vmat
-            G_inv_sqrt = _inv_sqrt_hermitian(G)
-            Vmat_iso_val = Vmat @ G_inv_sqrt  # projected value, no gradient tracked
-        # True STE: value = projected, backward = identity (Vmat - Vmat.detach() is 0 + grad)
-        Vmat_iso = Vmat_iso_val + (Vmat - Vmat.detach())
-        K_iso = Vmat_iso.reshape(V, W, n, n)
-        return K_iso
+        G_inv_sqrt = _inv_sqrt_hermitian(Vmat.mH @ Vmat)
+        K_iso = (Vmat @ G_inv_sqrt).reshape(V, W, n, n)
+        self.Kr.copy_(K_iso.real)
+        self.Ki.copy_(K_iso.imag)
 
     def povm(self, K: torch.Tensor) -> torch.Tensor:
         """POVM elements M_x = sum_w K_{x,w}^dag K_{x,w}; shape (V, n, n) complex."""
