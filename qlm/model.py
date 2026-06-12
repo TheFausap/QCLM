@@ -519,14 +519,25 @@ class QuantumChannelLM(nn.Module):
         cdtype = self.compute_dtype
 
         K = self.kraus_operators()               # projection forward: once
-        Kd = K.detach().requires_grad_(True)     # leaf seen by all chunks
-        Kr_iso, Ki_iso = Kd.real, Kd.imag        # differentiable views
+        # Materialise CONTIGUOUS real/imag copies (K.real/.imag are stride-2
+        # views into interleaved complex storage; gathering from them doubles
+        # read bandwidth on every chunk). Gradients are accumulated MANUALLY:
+        # each gathered chunk is its own autograd leaf and its small gradient
+        # is scatter-added into gKr/gKi. Routing chunk gradients through a
+        # full-size leaf instead (e.g. K.detach().requires_grad_()) makes
+        # autograd materialise a vocab-sized zero+scatter+accumulate (~13 GB)
+        # per chunk -- hundreds of GB/step of pure memory traffic.
+        Kr_full = K.real.detach().contiguous()   # (V, W, n, n) float32
+        Ki_full = K.imag.detach().contiguous()
+        gKr = torch.zeros_like(Kr_full)
+        gKi = torch.zeros_like(Ki_full)
 
         fast = self.fast_kernels and token_batches[0].device.type == "cuda"
         scan = _SCAN_CHUNK if fast else _scan_chunk_impl
 
         nll_total = torch.zeros((), dtype=self.rdtype,
                                 device=token_batches[0].device)
+        tail = gKr.shape[1:]
         for tokens in token_batches:
             B, L = tokens.shape
             rho = self.initial_rho(B, decohere=decohere)
@@ -535,17 +546,21 @@ class QuantumChannelLM(nn.Module):
             chunk = tbptt if tbptt > 0 else L
             for start in range(0, L, chunk):
                 tok_c = tokens[:, start:start + chunk]
-                Kr_chunk = Kr_iso[tok_c]         # (B, C, W, n, n) contiguous
-                Ki_chunk = Ki_iso[tok_c]
+                Kr_chunk = Kr_full[tok_c].requires_grad_(True)  # leaf per chunk
+                Ki_chunk = Ki_full[tok_c].requires_grad_(True)
                 nll_chunk, rho_r, rho_i = scan(
                     Kr_chunk, Ki_chunk, rho_r, rho_i, eps, decohere, cdtype)
                 (nll_chunk * inv).backward()     # frees THIS chunk's graph
+                idx = tok_c.reshape(-1)
+                gKr.index_put_((idx,), Kr_chunk.grad.reshape(-1, *tail),
+                               accumulate=True)
+                gKi.index_put_((idx,), Ki_chunk.grad.reshape(-1, *tail),
+                               accumulate=True)
                 nll_total += nll_chunk.detach()
                 rho_r = rho_r.detach()
                 rho_i = rho_i.detach()
 
-        if Kd.grad is not None:
-            K.backward(Kd.grad)                  # projection backward: once
+        K.backward(torch.complex(gKr, gKi))      # projection backward: once
         return float(nll_total) * inv
 
 
