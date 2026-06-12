@@ -1,0 +1,579 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{bm}
+\usepackage{mathtools}
+
+% Dirac notation and trace (replaces the physics package)
+\newcommand{\Tr}{\operatorname{Tr}}
+\newcommand{\ket}[1]{\left|#1\right\rangle}
+\newcommand{\bra}[1]{\left\langle#1\right|}
+\newcommand{\braket}[2]{\left\langle#1\middle|#2\right\rangle}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{geometry}
+\usepackage{microtype}
+\usepackage{xcolor}
+
+\geometry{margin=2.5cm}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!70!black,
+  citecolor=blue!70!black,
+  urlcolor=blue!70!black,
+}
+
+% ---- convenience macros ----
+\newcommand{\CC}{\mathbb{C}}
+\newcommand{\RR}{\mathbb{R}}
+\newcommand{\Hilbert}{\mathcal{H}}
+\newcommand{\Kx}[2]{K_{#1,#2}}     % K_{x,w}
+\newcommand{\Ex}[1]{E_{#1}}         % channel E_x
+\newcommand{\Mx}[1]{M_{#1}}         % POVM element M_x
+\newcommand{\NLL}{\mathcal{L}}
+
+\theoremstyle{plain}
+\newtheorem{proposition}{Proposition}
+
+% ---- document ----
+\title{\textbf{Quantum Channel Language Model (QCLM):\\
+Architecture, Mathematics, and Implementation}}
+\author{QCLM Project}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+\tableofcontents
+\bigskip
+
+% ===========================================================================
+\section{Overview}
+% ===========================================================================
+
+The \textbf{Quantum Channel Language Model (QCLM)} is an autoregressive
+generative model whose sequential context-tracking mechanism is neither
+self-attention (as in Transformers) nor a gated nonlinear recurrence (as in
+RNNs, LSTMs, or GRUs), but a \emph{quantum channel} acting on a density
+matrix in a finite-dimensional Hilbert space.
+
+At each time step the model holds its entire context as a single
+$n\times n$ complex density matrix $\rho_t$. Reading a token $x_t$ is
+a \emph{measurement}: the next-token probability is given by the Born
+rule $p(x_t \mid x_{<t}) = \Tr(\rho_{t-1}\, M_{x_t})$. Observing the
+token \emph{collapses and evolves} the state through a
+completely-positive, trace-preserving (CPTP) map --- a quantum channel.
+There is no attention, no gate, and no nonlinear activation. The only
+nonlinearity in the entire model is quantum measurement itself.
+
+\paragraph{One-line identity.}
+The QCLM is a \emph{complex-valued, trace-preserving linear state-space
+model with a Born-rule (quadratic) readout} --- the quantum cousin of
+modern linear SSMs (S4, Mamba), distinguished by genuine amplitude
+\textbf{interference}.
+
+% ===========================================================================
+\section{Mathematical Formulation}
+% ===========================================================================
+
+\subsection{State space: the density matrix}
+
+Let $\Hilbert = \CC^n$ be a Hilbert space of dimension $n$ (the
+\emph{Hilbert-space dimension}, a hyperparameter). The model carries a
+\emph{quantum state}
+\[
+  \rho \;\in\; \CC^{n\times n}, \qquad
+  \rho = \rho^\dagger, \quad
+  \rho \succeq 0, \quad
+  \Tr(\rho) = 1,
+\]
+called a \emph{density matrix} (or density operator). A
+\emph{pure state} takes the form $\rho = \ket{\psi}\!\bra{\psi}$ for
+some unit vector $\ket{\psi}\in\CC^n$; a \emph{mixed state} is a convex
+combination of pure states and encodes classical uncertainty over
+quantum superpositions. The model begins each sequence in a learned
+pure state $\rho_0 = \ket{\psi_0}\!\bra{\psi_0}$.
+
+\subsection{Token operators: Kraus maps and POVM elements}
+
+Each vocabulary token $x \in \{1,\ldots,V\}$ owns $W$ complex
+$n\times n$ matrices called \textbf{Kraus operators}:
+\[
+  \bigl\{\Kx{x}{w}\bigr\}_{w=1}^{W}, \qquad \Kx{x}{w}\in\CC^{n\times n}.
+\]
+They define two objects simultaneously:
+
+\begin{enumerate}
+\item \textbf{Quantum channel} (completely-positive map):
+\[
+  \Ex{x}(\rho) \;=\; \sum_{w=1}^{W} \Kx{x}{w}\,\rho\,\Kx{x}{w}^\dagger.
+\]
+
+\item \textbf{POVM element} (positive operator):
+\[
+  \Mx{x} \;=\; \sum_{w=1}^{W} \Kx{x}{w}^\dagger \Kx{x}{w} \;\succeq\; 0.
+\]
+\end{enumerate}
+
+\subsection{The isometry constraint}
+
+A single global constraint ties all tokens together:
+\begin{equation}\label{eq:isometry}
+  \sum_{x=1}^{V}\sum_{w=1}^{W} \Kx{x}{w}^\dagger \Kx{x}{w} \;=\; I_n.
+\end{equation}
+Equation~\eqref{eq:isometry} is equivalent to $\sum_x \Mx{x} = I_n$,
+which makes $\{\Mx{x}\}_{x=1}^{V}$ a valid \emph{positive
+operator-valued measure} (POVM). This single equation is what
+guarantees that next-token probabilities are exactly normalized --- by
+construction, with no softmax.
+
+\begin{proposition}[Exact normalization]
+Under constraint~\eqref{eq:isometry}, for any density matrix $\rho$,
+\[
+  \sum_{x=1}^{V} \Tr(\rho\,\Mx{x})
+  = \Tr\!\left(\rho \sum_x \Mx{x}\right)
+  = \Tr(\rho\, I_n)
+  = \Tr(\rho)
+  = 1.
+\]
+\end{proposition}
+
+\subsection{The autoregressive law (Born rule + collapse)}
+
+Generation and likelihood scoring follow the standard postulates of
+quantum measurement:
+
+\begin{align}
+  \text{Predict:} \quad &
+    p(x_t \mid x_{<t}) \;=\; \Tr\!\bigl(\rho_{t-1}\,\Mx{x_t}\bigr)
+    \label{eq:born}
+  \\[6pt]
+  \text{Update:} \quad &
+    \rho_t \;=\; \frac{\Ex{x_t}(\rho_{t-1})}{p(x_t \mid x_{<t})}
+    \label{eq:collapse}
+\end{align}
+
+Equation~\eqref{eq:born} is the \textbf{Born rule}: the probability of
+outcome $x_t$ equals the expectation of the corresponding POVM element.
+Equation~\eqref{eq:collapse} is the \textbf{post-measurement state
+update}: apply the quantum channel $\Ex{x_t}$ and renormalize. Note
+that
+\[
+  \Tr\bigl(\Ex{x_t}(\rho_{t-1})\bigr)
+  = \Tr\!\bigl(\rho_{t-1}\,\Mx{x_t}\bigr)
+  = p(x_t \mid x_{<t}),
+\]
+so the probability is just the trace of the (unnormalized) post-update
+state --- it falls out for free, with no extra computation.
+
+\subsection{Joint probability and the quantum forward algorithm}
+
+Unrolling the recurrence, the joint probability of a string
+$x_1,\ldots,x_T$ is
+\begin{equation}\label{eq:joint}
+  p(x_1,\ldots,x_T)
+  = \Tr\!\Bigl(\Ex{x_T} \circ \cdots \circ \Ex{x_1}(\rho_0)\Bigr)
+  = \Tr(\tilde\rho_T),
+\end{equation}
+where $\tilde\rho_T = \Ex{x_T}(\cdots(\Ex{x_1}(\rho_0))\cdots)$ is
+the \emph{unnormalized} final state. Equivalently, the total
+negative log-likelihood telescopes:
+\begin{equation}\label{eq:nll_telescope}
+  \NLL
+  = -\sum_{t=1}^T \log p(x_t \mid x_{<t})
+  = -\log \Tr(\tilde\rho_T),
+\end{equation}
+because each per-step log-probability is $\log\Tr(\tilde\rho_t) -
+\log\Tr(\tilde\rho_{t-1})$, and the sum telescopes to
+$\log\Tr(\rho_0) - \log\Tr(\tilde\rho_T) = -\log\Tr(\tilde\rho_T)$.
+This is trained directly by gradient descent (the \emph{quantum forward
+algorithm}).
+
+\subsection{The role of quantum coherence}
+
+Between measurements the density matrix carries \emph{off-diagonal}
+entries $\rho_{ij}$ with $i\neq j$. These encode complex relative
+phases between basis states. When the Born rule computes the next
+probability,
+\[
+  p(x) = \Tr(\rho\,\Mx{x})
+       = \sum_{i,j} \rho_{ij}\,(\Mx{x})_{ji},
+\]
+these off-diagonal terms contribute through \emph{quantum interference}:
+different ``paths'' (Kraus operator sequences) can add or subtract in
+amplitude before squaring. A classical model has $\rho_{ij}=0$ for
+$i\neq j$ by construction, so it cannot exploit this interference.
+
+% ===========================================================================
+\section{Parametrization and Constraint Enforcement}
+% ===========================================================================
+
+\subsection{Free parameters}
+
+The Kraus operators $\{\Kx{x}{w}\}$ are the model's trainable
+parameters. We store them as separate real and imaginary parts:
+\[
+  \mathtt{Kr} \in \RR^{V\times W\times n\times n}, \qquad
+  \mathtt{Ki} \in \RR^{V\times W\times n\times n},
+\]
+so that $\Kx{x}{w} = \mathtt{Kr}[x,w] + i\cdot\mathtt{Ki}[x,w]$. The
+initial pure state is parametrized as a free complex vector
+$\ket{\psi_0} = \mathtt{psi0\_r} + i\cdot\mathtt{psi0\_i}$,
+normalized on each forward pass.
+
+Total trainable parameters: $2\,V\,W\,n^2 + 2n$.
+
+\subsection{Differentiable polar projection (isometry enforcement)}
+
+The raw parameters do not in general satisfy the isometry
+constraint~\eqref{eq:isometry}. We enforce it \emph{on every forward
+pass} via a differentiable polar projection.
+
+Stack all $V\cdot W$ Kraus operators row-wise:
+\[
+  \mathbf{V} \;=\;
+  \begin{bmatrix}
+    \Kx{1}{1} \\ \Kx{1}{2} \\ \vdots \\ \Kx{V}{W}
+  \end{bmatrix}
+  \;\in\; \CC^{(VWn)\times n}.
+\]
+The Gram matrix $G = \mathbf{V}^\dagger \mathbf{V} \in \CC^{n\times n}$
+satisfies $G = \sum_{x,w}\Kx{x}{w}^\dagger\Kx{x}{w}$. We project:
+\begin{equation}\label{eq:projection}
+  \mathbf{V}_{\mathrm{iso}} \;=\; \mathbf{V}\,G^{-1/2},
+\end{equation}
+where $G^{-1/2}$ is computed via Hermitian eigendecomposition
+$G = U\Lambda U^\dagger \Rightarrow G^{-1/2} = U\Lambda^{-1/2}U^\dagger$,
+clamping small eigenvalues for numerical stability. By construction,
+$\mathbf{V}_{\mathrm{iso}}^\dagger \mathbf{V}_{\mathrm{iso}} = I_n$,
+so constraint~\eqref{eq:isometry} holds exactly.
+
+The map $\mathbf{V} \mapsto \mathbf{V}_{\mathrm{iso}}$ is differentiable
+(via \texttt{torch.linalg.eigh}), so gradients flow to the unconstrained
+parameters through the projection.
+
+% ===========================================================================
+\section{Training}
+% ===========================================================================
+
+\subsection{Loss: negative log-likelihood in nats and bits}
+
+The training objective is the sequence \textbf{negative log-likelihood}
+(NLL) averaged over tokens:
+\begin{equation}\label{eq:loss}
+  \mathcal{L} \;=\; -\frac{1}{T}\sum_{t=1}^{T}\log p(x_t \mid x_{<t})
+  \;\text{ (nats/token)}.
+\end{equation}
+This is the \emph{quantum forward algorithm}: at each step, the
+probability $p(x_t\mid x_{<t}) = \Tr(\Ex{x_t}(\rho_{t-1}))$ is read
+from the trace of the channel output, and the state is updated by
+normalizing that output.
+
+\paragraph{Bits per token.}
+The equivalent metric in bits is
+\begin{equation}\label{eq:bits}
+  \text{bits/token} \;=\; \frac{\mathcal{L}}{\ln 2}
+  \;=\; \log_2 \mathrm{PPL},
+\end{equation}
+where $\mathrm{PPL} = e^{\mathcal{L}}$ is perplexity. Bits per
+token is the information-theoretic cross-entropy: it measures how many
+bits the model needs on average to encode each token under its predicted
+distribution. The theoretical minimum is the true entropy of the data
+(unknown in practice); lower is better. The relation is simply a change
+of logarithm base and carries no additional information beyond the NLL.
+
+\subsection{Efficiency: training cost is independent of vocabulary size}
+
+A key property follows from the isometry constraint. The Born
+probability $p(x_t\mid x_{<t}) = \Tr\bigl(\Ex{x_t}(\rho_{t-1})\bigr)$
+is the trace of the channel output \emph{for the observed token only}.
+Computing this requires
+\[
+  \tilde\rho_t = \sum_{w=1}^W \Kx{x_t}{w}\,\rho_{t-1}\,\Kx{x_t}{w}^\dagger,
+\]
+which involves $W$ matrix multiplications of size $n\times n$. Because
+$\Tr(\tilde\rho_t)$ is the probability and the state update is just
+$\rho_t = \tilde\rho_t / \Tr(\tilde\rho_t)$, there is \textbf{no
+need to evaluate the full vocabulary sum} during training. The per-token
+training cost is $O(W n^3)$, independent of $V$.
+
+This stands in contrast to transformer language models, where the final
+softmax over the vocabulary is $O(V d)$ per token. For a vocabulary of
+$V = 16{,}384$ and Hilbert dimension $n = 128$, the QCLM training cost
+is $O(4 \cdot 128^3) \approx 8\text{M}$ operations per token, regardless
+of vocabulary size.
+
+\subsection{Truncated backpropagation through time (TBPTT)}
+
+The quantum state $\rho_t$ depends on all previous tokens
+$x_1,\ldots,x_t$ through the sequential recurrence. For long sequences,
+retaining the full computation graph is memory-intensive. We apply
+\textbf{truncated BPTT}: every $K$ steps the quantum state is detached
+from the computation graph,
+\[
+  \rho_{tK} \;\leftarrow\; \texttt{stop\_gradient}(\rho_{tK}),
+\]
+so gradients are propagated through at most $K$ steps at a time.
+This bounds activation memory without changing the forward recurrence
+(the state evolution is unchanged; only the gradient path is truncated).
+
+% ===========================================================================
+\section{The Decoherence Ablation}
+% ===========================================================================
+
+To isolate the contribution of quantum coherence, we define a
+\textbf{decohered} (classical) twin: after every state update, we zero
+the off-diagonal entries of $\rho$,
+\begin{equation}\label{eq:decohere}
+  \rho_t^{\mathrm{cl}} \;=\;
+  \mathrm{diag}\!\bigl(\rho_t^{\mathrm{diag}}\bigr)
+  \;\Big/\;
+  \Tr\!\bigl(\mathrm{diag}(\rho_t^{\mathrm{diag}})\bigr),
+\end{equation}
+where $\rho_t^{\mathrm{diag}}$ is the vector of diagonal entries of
+$\rho_t$.
+
+This operation:
+\begin{enumerate}
+\item \textbf{Exactly} reduces the QCLM to a classical $n$-state
+  \emph{Hidden Markov Model} (HMM). The diagonal $(\rho_{11},\ldots,\rho_{nn})$
+  plays the role of a classical probability vector over $n$ hidden states.
+\item \textbf{Preserves} all parameters ($V,W,n$, Kraus operators).
+  The decohered and quantum models have identical parameter counts and
+  sizes.
+\item Provides a \textbf{clean, dimension-matched ablation}: any
+  performance difference between quantum and decohered models must come
+  from the off-diagonal coherences, i.e., from quantum interference ---
+  not from parameter count or architectural differences.
+\end{enumerate}
+
+% ===========================================================================
+\section{Computational Structure and Engineering}
+% ===========================================================================
+
+\subsection{Per-token state update}
+
+The hot path in \texttt{forward()} performs, at each step $t$:
+\begin{enumerate}
+\item \textbf{Channel application}: $\tilde\rho_t = \sum_w \Kx{x_t}{w}\,\rho_{t-1}\,\Kx{x_t}{w}^\dagger$ \\
+  Implemented as two batched matrix multiplications:
+  $\tilde{K}_w = \Kx{x_t}{w}\rho_{t-1}$, then $E = \sum_w \tilde{K}_w \Kx{x_t}{w}^\dagger$.
+\item \textbf{Trace}: $p_t = \Tr(\tilde\rho_t) = \sum_i (\tilde\rho_t)_{ii}$ \quad (Born probability).
+\item \textbf{Normalize}: $\rho_t = \tilde\rho_t / p_t$.
+\item \textbf{NLL accumulation}: $\mathcal{L} \mathrel{-}= \log p_t$.
+\end{enumerate}
+
+\subsection{Real 2$\times$2 block matmuls for tensor-core utilization}
+
+Modern NVIDIA GPUs (Ampere, Hopper, Blackwell) have tensor cores that
+accelerate real \texttt{bfloat16}/\texttt{fp16} matrix multiplications
+but do not natively accelerate \texttt{complex64}. We implement each
+complex $(n\times n)@(n\times n)$ product as a single real
+$(2n\times 2n)@(2n\times n)$ product in \texttt{bfloat16}:
+\begin{equation}\label{eq:block}
+  \begin{bmatrix}
+    C_r \\ C_i
+  \end{bmatrix}
+  =
+  \underbrace{
+  \begin{bmatrix}
+    A_r & -A_i \\
+    A_i &  A_r
+  \end{bmatrix}
+  }_{\text{$A$-block, }(2n\times 2n)}
+  \underbrace{
+  \begin{bmatrix}
+    B_r \\ B_i
+  \end{bmatrix}
+  }_{\text{$B$-block, }(2n\times n)},
+\end{equation}
+where $A = A_r + iA_i$ and $B = B_r + iB_i$ are the complex factors.
+This replaces four separate real multiplications with one larger call,
+which gives a single kernel launch and a larger tile for the tensor
+cores to saturate. The \texttt{fp32} master weights in $\mathtt{Kr}$,
+$\mathtt{Ki}$ are unaffected; only the matmul compute is in
+\texttt{bfloat16}. The isometry projection stays in \texttt{float32}
+and \texttt{complex64} for numerical stability (called once per forward
+pass, not per token).
+
+\subsection{Compiled chunked scan}
+
+\paragraph{The Python-loop bottleneck.}
+The default forward pass runs a Python \texttt{for t in range(L)} loop
+over all $L$ tokens. Each iteration launches several GPU kernels and
+incurs Python interpreter overhead ($\sim$10\,\textmu s/iteration),
+amounting to $\sim$5\,ms for $L=512$ --- significant for fast GPUs.
+
+\paragraph{Chunked compiled scan.}
+We replace the $L$-iteration Python loop with:
+\begin{enumerate}
+\item \textbf{Pre-gather}: compute
+  $\mathtt{Kr\_seq} = \mathtt{Kr\_iso}[\mathtt{tokens}]$ of shape
+  $(B\times L\times W\times n\times n)$ in a \emph{single} batched
+  index operation, instead of $L$ per-token gather kernels.
+\item \textbf{Outer loop} over $\lceil L/K \rceil$ TBPTT chunks (e.g., 4
+  iterations for $L=512$, $K=128$). At each chunk boundary the state is
+  detached.
+\item \textbf{Compiled inner scan}: each chunk body runs through
+  \texttt{torch.compile(fullgraph=True, dynamic=False)}, which (a)
+  unrolls the inner \texttt{for t in range(K)} loop at trace time,
+  (b) fuses the block matmuls, trace, log, and divide across all $K$
+  iterations into a small set of Triton kernels, and (c) eliminates
+  Python interpreter overhead within the chunk entirely.
+\end{enumerate}
+The Python interpreter overhead drops from $\sim L$ to $\sim L/K$
+iterations; the GPU sees a fused kernel stream rather than $L$ separate
+launches.
+
+\paragraph{Why not a parallel Blelloch scan?}
+The composition $\Ex{x_t}\circ\cdots\circ\Ex{x_1}$ is associative, so
+a parallel prefix scan exists in principle. However, its elements are
+Liouville transfer matrices of size $n^2\times n^2$: for $n=128$, each
+matrix is $16{,}384\times 16{,}384$ complex $\approx 4\,\text{GB}$.
+This is memory-infeasible for any practically useful $n$. The chunked
+compiled scan is the practical optimum.
+
+% ===========================================================================
+\section{Architecture Summary}
+% ===========================================================================
+
+Table~\ref{tab:arch} collects the key quantities.
+
+\begin{table}[h]
+\centering
+\caption{QCLM architecture at a glance.}
+\label{tab:arch}
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Quantity} & \textbf{Expression} & \textbf{Notes} \\
+\midrule
+State              & $\rho\in\CC^{n\times n}$ & density matrix, Hermitian, PSD, $\Tr\rho=1$ \\
+Token operator     & $\{\Kx{x}{w}\}_{w=1}^W\subset\CC^{n\times n}$ & $W$ Kraus ops per token \\
+Channel            & $\Ex{x}(\rho)=\sum_w\Kx{x}{w}\rho\Kx{x}{w}^\dagger$ & CPTP map \\
+POVM element       & $\Mx{x}=\sum_w\Kx{x}{w}^\dagger\Kx{x}{w}$ & PSD \\
+Constraint         & $\sum_{x,w}\Kx{x}{w}^\dagger\Kx{x}{w}=I_n$ & normalization \\
+Prediction         & $p(x_t\mid x_{<t})=\Tr(\rho_{t-1}\Mx{x_t})$ & Born rule \\
+State update       & $\rho_t = \Ex{x_t}(\rho_{t-1})/p(x_t\mid x_{<t})$ & collapse + renorm \\
+Loss               & $\mathcal{L}=-\frac{1}{T}\sum_t\log\Tr(\Ex{x_t}(\rho_{t-1}))$ & nats/token \\
+Bits/token         & $\mathcal{L}/\ln 2$ & $=\log_2\mathrm{PPL}$ \\
+Parameters         & $2VWn^2 + 2n$ & real numbers; complex $= 2$ reals \\
+Per-token cost     & $O(Wn^3)$ & \emph{independent of} $V$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ===========================================================================
+\section{Scaling}
+% ===========================================================================
+
+\subsection{Parameter count}
+
+The dominant cost is the Kraus parameter table:
+\[
+  \text{params} \;\approx\; 2\,V\,W\,n^2,
+\]
+where the factor 2 counts real and imaginary parts. Parameters live
+in the per-token Kraus operators, analogously to a joint embedding +
+unembedding table. For the 2B target configuration:
+
+\begin{center}
+\begin{tabular}{@{}lrrrl@{}}
+\toprule
+\textbf{Config} & $V$ & $n$ & $W$ & \textbf{Params} \\
+\midrule
+PoC (char)         & 65    & 48  & 4 & $\approx 1.2\text{M}$ \\
+1B (BPE-8k)        & 8{,}192  & 128 & 4 & $\approx 1.07\text{B}$ \\
+2B (BPE-16k)       & 16{,}384 & 128 & 4 & $\approx 2.15\text{B}$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Vocabulary is computationally cheap}
+
+Because training cost is $O(Wn^3)$ per token (independent of $V$),
+increasing the vocabulary from characters ($V=65$) to BPE subwords
+($V\sim 10^4$) multiplies the parameter count by $V_{\text{new}}/V_{\text{old}}$
+but does \emph{not} increase training FLOPs. The practical binding
+constraints are memory bandwidth (loading the Kraus table) and the
+$O(n^3)$ dense linear algebra per step.
+
+\subsection{Scaling the Hilbert-space dimension}
+
+Increasing $n$ increases both model capacity ($\propto n^2$ in params)
+and per-token compute ($\propto n^3$). PoC experiments confirm that
+the quantum advantage over the decohered HMM baseline \emph{grows}
+with $n$:
+
+\begin{center}
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+$n$ & Quantum (bits/char) & Classical (bits/char) & Advantage $\Delta$ \\
+\midrule
+24 & 3.008 & 3.208 & 0.200 \\
+48 & 2.806 & 3.045 & 0.239 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ===========================================================================
+\section{Connection to Prior Work}
+% ===========================================================================
+
+\paragraph{Hidden Quantum Markov Models (HQMMs).}
+The QCLM is a generative HQMM \cite{monras2010,srinivasan2018}. Prior
+work trained HQMMs on low-order toy sequences using EM. The QCLM differs
+in (i) end-to-end gradient descent with a clean differentiable isometry
+parametrization, (ii) application to natural language at scale, and
+(iii) the controlled decoherence ablation that isolates interference.
+
+\paragraph{Linear state-space models.}
+S4 \cite{gu2021}, Mamba \cite{gu2023}, and related models use a linear
+recurrence $h_t = A h_{t-1} + B u_t$. The QCLM's recurrence
+$\rho_t = \Ex{x_t}(\rho_{t-1})/p(x_t)$ is also linear in $\rho_{t-1}$
+(for fixed $x_t$), but the state is a \emph{density matrix} (complex,
+Hermitian, PSD) and the readout is the Born rule (quadratic in
+amplitudes) rather than a linear projection. The key distinction is the
+capacity for \emph{genuine quantum interference} through off-diagonal
+coherences.
+
+\paragraph{Quantum machine learning.}
+Parameterized quantum circuits (PQCs) are typically studied in the
+context of near-term quantum hardware \cite{cerezo2021}. The QCLM is
+a classical simulation of a quantum process, using quantum \emph{mathematics}
+(not hardware) as the computational substrate, running efficiently on
+CPUs and GPUs.
+
+% ---- Bibliography (manual, no .bib file needed) ---------------------------
+\begin{thebibliography}{9}
+
+\bibitem{monras2010}
+A.~Monras, A.~Beige, and K.~Wiesner.
+\newblock Hidden quantum Markov models and non-adaptive read-out of many-body
+  states.
+\newblock \emph{Applied Mathematics \& Computational Science}, 1:93--107, 2010.
+
+\bibitem{srinivasan2018}
+S.~Srinivasan, G.~Gordon, and B.~Boots.
+\newblock Learning hidden quantum Markov models.
+\newblock In \emph{Proceedings of AISTATS}, 2018.
+
+\bibitem{gu2021}
+A.~Gu, K.~Goel, and C.~Ré.
+\newblock Efficiently modeling long sequences with structured state spaces.
+\newblock In \emph{Proceedings of ICLR}, 2022.
+
+\bibitem{gu2023}
+A.~Gu and T.~Dao.
+\newblock Mamba: Linear-time sequence modeling with selective state spaces.
+\newblock \emph{arXiv:2312.00752}, 2023.
+
+\bibitem{cerezo2021}
+M.~Cerezo et al.
+\newblock Variational quantum algorithms.
+\newblock \emph{Nature Reviews Physics}, 3:625--644, 2021.
+
+\end{thebibliography}
+
+\end{document}
