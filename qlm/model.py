@@ -515,7 +515,13 @@ class QuantumChannelLM(nn.Module):
         """
         total_tok = sum(int(t.numel()) for t in token_batches)
         inv = 1.0 / float(total_tok)
-        eps = 1e-6
+        # Train-time probability floor 1e-5 (eval keeps 1e-6): caps the per-step
+        # backward amplification through rho = E/p at 1e5. As the model sharpens,
+        # genuinely surprising tokens hit the floor more often; at 1e-6 a couple
+        # of floor events compounding within one 128-step chunk overflow the
+        # bf16 backward. The floor only binds for tokens the model ranks below
+        # ~1/6 of uniform, so the loss/gradient bias is negligible.
+        eps = 1e-5
         cdtype = self.compute_dtype
 
         K = self.kraus_operators()               # projection forward: once
@@ -538,6 +544,7 @@ class QuantumChannelLM(nn.Module):
         nll_total = torch.zeros((), dtype=self.rdtype,
                                 device=token_batches[0].device)
         tail = gKr.shape[1:]
+        dropped = 0
         for tokens in token_batches:
             B, L = tokens.shape
             rho = self.initial_rho(B, decohere=decohere)
@@ -548,19 +555,45 @@ class QuantumChannelLM(nn.Module):
                 tok_c = tokens[:, start:start + chunk]
                 Kr_chunk = Kr_full[tok_c].requires_grad_(True)  # leaf per chunk
                 Ki_chunk = Ki_full[tok_c].requires_grad_(True)
+                if start == 0:
+                    # Chunk 0 is the only chunk whose backward reaches psi0
+                    # (later chunks start from a detached rho). Snapshot psi0
+                    # grads so a non-finite chunk can be fully discarded.
+                    psi_snap = [None if p.grad is None else p.grad.clone()
+                                for p in (self.psi0_r, self.psi0_i)]
                 nll_chunk, rho_r, rho_i = scan(
                     Kr_chunk, Ki_chunk, rho_r, rho_i, eps, decohere, cdtype)
                 (nll_chunk * inv).backward()     # frees THIS chunk's graph
-                idx = tok_c.reshape(-1)
-                gKr.index_put_((idx,), Kr_chunk.grad.reshape(-1, *tail),
-                               accumulate=True)
-                gKi.index_put_((idx,), Ki_chunk.grad.reshape(-1, *tail),
-                               accumulate=True)
-                nll_total += nll_chunk.detach()
+                ok = bool(torch.isfinite(Kr_chunk.grad).all()
+                          and torch.isfinite(Ki_chunk.grad).all()
+                          and torch.isfinite(nll_chunk))
+                if ok:
+                    idx = tok_c.reshape(-1)
+                    gKr.index_put_((idx,), Kr_chunk.grad.reshape(-1, *tail),
+                                   accumulate=True)
+                    gKi.index_put_((idx,), Ki_chunk.grad.reshape(-1, *tail),
+                                   accumulate=True)
+                    nll_total += nll_chunk.detach()
+                else:
+                    # Contain the blow-up to this ONE chunk: its gradient is
+                    # never scattered, and if it was a chunk-0 backward the
+                    # psi0 grads are rolled back. The other chunks of the step
+                    # proceed normally (previously one bad chunk discarded the
+                    # whole optimizer step: 32x more data wasted).
+                    dropped += 1
+                    if start == 0:
+                        for p, g in zip((self.psi0_r, self.psi0_i), psi_snap):
+                            if g is None:
+                                p.grad = None
+                            elif p.grad is not None:
+                                p.grad.copy_(g)
                 rho_r = rho_r.detach()
                 rho_i = rho_i.detach()
 
         K.backward(torch.complex(gKr, gKi))      # projection backward: once
+        if dropped:
+            print(f"   [chunk-drop] {dropped} non-finite chunk(s) discarded "
+                  f"(gradients contained; step proceeds)")
         return float(nll_total) * inv
 
 
