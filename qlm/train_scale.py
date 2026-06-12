@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
 from qlm.model import QuantumChannelLM
 from qlm.tokenizer import BPETokenizer
-from qlm.data_fineweb import make_stream, fineweb_doc_iter, local_doc_iter
+from qlm.data_fineweb import make_stream, fineweb_doc_iter, local_doc_iter, DocCounter
 
 LN2 = math.log(2.0)
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -128,17 +128,28 @@ def main():
     V = tok.vocab_size
     print("vocab_size:", V)
 
-    def new_stream():
+    def new_stream(skip_docs: int = 0, counter: DocCounter | None = None):
         kw = dict(source=args.source)
         if args.source == "fineweb":
             kw.update(name=args.fineweb_name, dataset=args.fineweb_dataset)
         else:
             kw.update(path=args.local_path, loop=True)
-        return make_stream(tok, args.block, args.batch, tok.eot_id, **kw)
+        return make_stream(tok, args.block, args.batch, tok.eot_id,
+                           skip_docs=skip_docs, counter=counter, **kw)
 
-    stream = new_stream()
+    # The held-out eval set is ALWAYS the first eval_batches batches of the
+    # stream -- identical on every run/resume (the stream is deterministic).
     print("pulling held-out eval set ...")
-    eval_batches = [next(stream) for _ in range(args.eval_batches)]
+    eval_counter = DocCounter()
+    eval_stream = new_stream(counter=eval_counter)
+    eval_batches = [next(eval_stream) for _ in range(args.eval_batches)]
+    del eval_stream
+
+    # The TRAINING stream starts right after the eval region on a fresh run.
+    # On resume it fast-forwards to the checkpointed document position so the
+    # model never re-reads data it has already trained on (re-reading both
+    # wastes tokens and silently flatters the train loss with memorisation).
+    # docs_seen counts eval docs too, so a fresh run's hold-out is preserved.
 
     model = QuantumChannelLM(V, dim=args.dim, kraus=args.kraus,
                              fast_kernels=args.fast_kernels).to(device)
@@ -154,7 +165,7 @@ def main():
         return args.lr * (0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * min(prog, 1.0))))
 
     # ── Resume from checkpoint ────────────────────────────────────────────────
-    start_step = 0; seen_tok = 0; best = float("inf")
+    start_step = 0; seen_tok = 0; best = float("inf"); docs_skip = 0
     if args.resume:
         if not os.path.exists(args.resume):
             raise FileNotFoundError(f"--resume: checkpoint not found: {args.resume}")
@@ -179,9 +190,25 @@ def main():
                   "pass --keep_opt only if the ckpt was saved by this code version)")
         start_step = ckpt.get("step", 0)
         seen_tok   = ckpt.get("seen_tokens", 0)
+        docs_skip  = ckpt.get("docs_seen", 0)
+        if docs_skip:
+            print(f"  data stream: skipping {docs_skip} docs to resume position "
+                  f"(streams past them without tokenising; may take a few minutes)")
+        else:
+            print("  WARNING: checkpoint has no data position (saved by older "
+                  "code) -- the stream restarts from the beginning and will "
+                  "re-read previously seen data this run.")
         best       = ckpt.get("val_bits", float("inf"))
         print(f"resumed from {args.resume}")
         print(f"  start_step={start_step}  seen={seen_tok/1e6:.1f}M tok  best={best:.3f}")
+
+    # Training stream: skip past everything already consumed. On a fresh run
+    # that is exactly the eval region (hold-out preserved); on resume it is the
+    # checkpointed absolute document position. Old checkpoints without a data
+    # position still skip at least the eval region.
+    train_skip = max(docs_skip, eval_counter.count)
+    doc_counter = DocCounter(base=train_skip)
+    stream = new_stream(skip_docs=train_skip, counter=doc_counter)
 
     cfg = vars(args).copy(); cfg.update(vocab_size=V, num_params=params, device=str(device))
     # Drop keys that are irrelevant for the chosen source to keep the banner clean.
@@ -199,7 +226,8 @@ def main():
     def save_ckpt(label: str, extra: dict | None = None):
         path = os.path.join(args.out, f"{args.tag}_{label}.pt")
         payload = {"model": model.state_dict(), "opt": opt.state_dict(),
-                   "cfg": cfg, "step": step, "seen_tokens": seen_tok}
+                   "cfg": cfg, "step": step, "seen_tokens": seen_tok,
+                   "docs_seen": doc_counter.total}
         if extra:
             payload.update(extra)
         torch.save(payload, path)

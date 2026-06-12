@@ -18,22 +18,56 @@ import torch
 # ---------------------------------------------------------------------------
 def fineweb_doc_iter(name: str = "sample-10BT", split: str = "train",
                      dataset: str = "HuggingFaceFW/fineweb-edu",
-                     text_key: str = "text") -> Iterator[str]:
-    """Stream documents from FineWeb(-Edu). Requires internet (use on the Spark)."""
+                     text_key: str = "text", skip_docs: int = 0) -> Iterator[str]:
+    """Stream documents from FineWeb(-Edu). Requires internet (use on the Spark).
+
+    skip_docs: fast-forward the stream past the first `skip_docs` documents
+    (used to resume training at the correct data position instead of
+    re-reading the corpus from the start)."""
     from datasets import load_dataset
     ds = load_dataset(dataset, name=name, split=split, streaming=True)
+    if skip_docs:
+        ds = ds.skip(skip_docs)
     for ex in ds:
         t = ex.get(text_key)
         if t:
             yield t
 
 
-def local_doc_iter(path: str, doc_sep: str = "\n\n") -> Iterator[str]:
+def local_doc_iter(path: str, doc_sep: str = "\n\n",
+                   skip_docs: int = 0) -> Iterator[str]:
     """Split a local text file into pseudo-documents (for offline testing)."""
     text = open(path, "r", encoding="utf-8").read()
+    seen = 0
     for doc in text.split(doc_sep):
         doc = doc.strip()
         if doc:
+            seen += 1
+            if seen <= skip_docs:
+                continue
+            yield doc
+
+
+class DocCounter:
+    """Tracks the absolute document position of a stream.
+
+    `base` is the number of documents skipped before this process attached
+    (restored from a checkpoint); `count` is what this process has consumed.
+    `total` is therefore an absolute position in the (deterministic) stream,
+    suitable for checkpointing and for `skip_docs` on the next resume.
+    """
+
+    def __init__(self, base: int = 0):
+        self.base = int(base)
+        self.count = 0
+
+    @property
+    def total(self) -> int:
+        return self.base + self.count
+
+    def wrap(self, it: Iterable[str]) -> Iterator[str]:
+        for doc in it:
+            self.count += 1
             yield doc
 
 
@@ -72,13 +106,25 @@ def batch_iter(block_iter: Iterable[np.ndarray], batch_size: int) -> Iterator[to
 
 
 def make_stream(tokenizer, block_size: int, batch_size: int, eot_id: int,
-                source: str = "fineweb", **kw) -> Iterator[torch.Tensor]:
+                source: str = "fineweb", skip_docs: int = 0,
+                counter: "DocCounter | None" = None, **kw) -> Iterator[torch.Tensor]:
+    """Build the packed-batch stream.
+
+    skip_docs: fast-forward past this many documents (resume support).
+        Document-granular: the partial packing buffer at the skip point is
+        not reconstructed, so the stream realigns within ~1 block.
+    counter: optional DocCounter; if given, every document consumed by this
+        stream advances it, so its .total can be checkpointed.
+    """
     if source == "fineweb":
-        docs = fineweb_doc_iter(**{k: kw[k] for k in ("name", "split", "dataset", "text_key") if k in kw})
+        docs = fineweb_doc_iter(skip_docs=skip_docs,
+                                **{k: kw[k] for k in ("name", "split", "dataset", "text_key") if k in kw})
         loop = False
     else:  # local file path in kw['path']
-        docs = local_doc_iter(kw["path"], kw.get("doc_sep", "\n\n"))
+        docs = local_doc_iter(kw["path"], kw.get("doc_sep", "\n\n"), skip_docs=skip_docs)
         loop = kw.get("loop", True)
+    if counter is not None:
+        docs = counter.wrap(docs)
     blocks = iter_token_blocks(docs, tokenizer, block_size, eot_id, loop=loop)
     return batch_iter(blocks, batch_size)
 
