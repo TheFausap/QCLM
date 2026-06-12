@@ -235,9 +235,16 @@ def _scan_chunk_impl(
     """
     C = Kr_chunk.shape[1]
     nll_chunk = torch.zeros((), dtype=rho_r.dtype, device=rho_r.device)
+    # Per-step access via unbind, NOT indexing. The forward cost is identical,
+    # but the backward of unbind is a single stack over the chunk, whereas
+    # `Kr_chunk[:, t]` emits one select_backward per step: C full-chunk-sized
+    # zero+accumulate passes = O(C^2) memory traffic. Profiling showed those
+    # select_backward kernels consuming ~91% of the training step on GB10.
+    Kr_steps = Kr_chunk.unbind(1)
+    Ki_steps = Ki_chunk.unbind(1)
     for t in range(C):
-        Kr_x = Kr_chunk[:, t]   # (B, W, n, n) — slice, no gather kernel
-        Ki_x = Ki_chunk[:, t]
+        Kr_x = Kr_steps[t]   # (B, W, n, n)
+        Ki_x = Ki_steps[t]
         Krho_r, Krho_i = _cplx_mm_block(
             Kr_x, Ki_x, rho_r.unsqueeze(1), rho_i.unsqueeze(1), cdtype)
         E_r, E_i = _cplx_mm_dag_block(Krho_r, Krho_i, Kr_x, Ki_x, cdtype)
