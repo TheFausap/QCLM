@@ -48,7 +48,15 @@ def one_step(model, opt, tokens, args, phases=None):
         sync(dev); return time.perf_counter()
 
     opt.zero_grad(set_to_none=True)
-    for _ in range(args.grad_accum):
+    if hasattr(model, "training_step"):
+        # chunk-interleaved fused fwd+bwd path
+        t0 = stamp()
+        model.training_step([tokens] * args.grad_accum, tbptt=args.tbptt)
+        t1 = stamp()
+        if phases is not None:
+            phases["fwd+bwd"] += (t1 - t0) * 1e3
+    else:
+      for _ in range(args.grad_accum):
         t0 = stamp()
         out = model.forward(tokens, tbptt=args.tbptt)
         t1 = stamp()
@@ -114,7 +122,10 @@ def main():
     print(f"dynamo frame/compile counter after warmup: {rc1}  (delta from start: {rc1 - rc0})")
 
     # ---- timed phase breakdown -------------------------------------------------
-    phases = {"forward": 0.0, "backward": 0.0, "clip+opt": 0.0, "reproject": 0.0}
+    from collections import defaultdict
+    phases = defaultdict(float)
+    if dev.type == "cuda":
+        torch.cuda.reset_peak_memory_stats()
     rc_before = recompile_count()
     t0 = time.perf_counter()
     for _ in range(args.timed_steps):
@@ -132,6 +143,9 @@ def main():
     print(f"  {'TOTAL':10s} {step_ms:10.0f} ms   ->  {tok_per_step / (step_ms/1e3):,.0f} tok/s")
     print(f"recompiles during timed steps: {rc_after - rc_before} "
           f"(MUST be 0 -- if not, guards are recompiling every step)")
+    if dev.type == "cuda":
+        peak = torch.cuda.max_memory_allocated() / 2**30
+        print(f"peak CUDA memory during timed steps: {peak:.1f} GiB")
 
     # ---- torch.profiler over one step ------------------------------------------
     print("\nprofiling one step ...")

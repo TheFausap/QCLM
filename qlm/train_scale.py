@@ -214,13 +214,10 @@ def main():
             for pg in opt.param_groups:
                 pg["lr"] = lr_at(step)
             opt.zero_grad(set_to_none=True)
-            acc_nll = 0.0
-            for _ in range(args.grad_accum):
-                seqs = next(stream).to(device)
-                out = model.forward(seqs, tbptt=args.tbptt)
-                (out["loss"] / args.grad_accum).backward()
-                acc_nll += out["nll_sum"].item(); run_tok += out["n_tokens"]; seen_tok += out["n_tokens"]
-            run_nll += acc_nll
+            batches = [next(stream).to(device) for _ in range(args.grad_accum)]
+            mean_nll = model.training_step(batches, tbptt=args.tbptt)
+            ntok = sum(int(b.numel()) for b in batches)
+            run_nll += mean_nll * ntok; run_tok += ntok; seen_tok += ntok
             gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
             if torch.isnan(gnorm) or torch.isinf(gnorm):
                 print(f"step {step+1}: NaN/Inf gnorm — skipping optimizer step")

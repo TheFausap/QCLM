@@ -485,6 +485,70 @@ class QuantumChannelLM(nn.Module):
             out["probs"] = torch.stack(prob_log, dim=1)            # (B, L, V)
         return out
 
+    def training_step(self, token_batches, tbptt: int = 0,
+                      decohere: bool = False) -> float:
+        """Forward + backward for ONE optimizer step. Gradient-equivalent (for
+        equal-sized microbatches) to:
+
+            for tokens in token_batches:
+                (self.forward(tokens, tbptt=tbptt)["loss"] / len(token_batches)).backward()
+
+        but substantially cheaper in memory and compute:
+
+          1. Chunk-interleaved backward. TBPTT detaches the state at chunk
+             boundaries, so each chunk's autograd graph is independent of the
+             others. Running backward immediately after each chunk's forward
+             frees that chunk's activations before the next chunk is computed:
+             live activation memory shrinks ~(L / tbptt)x, enabling much larger
+             batch sizes before unified-memory paging.
+          2. The Kraus projection (forward AND Loewner backward) runs ONCE per
+             optimizer step instead of once per microbatch. The scan consumes a
+             detached leaf copy of K_iso; its accumulated gradient is pushed
+             through the projection in a single backward call at the end.
+             Exact by linearity of the chain rule.
+          3. Kraus operators are gathered per chunk rather than per sequence
+             (lower peak memory; advanced indexing returns contiguous tensors,
+             so no extra .contiguous() copy).
+
+        Accumulates gradients into the model parameters; the caller still does
+        clip_grad_norm_ + opt.step(). Returns mean NLL in nats/token.
+        """
+        total_tok = sum(int(t.numel()) for t in token_batches)
+        inv = 1.0 / float(total_tok)
+        eps = 1e-6
+        cdtype = self.compute_dtype
+
+        K = self.kraus_operators()               # projection forward: once
+        Kd = K.detach().requires_grad_(True)     # leaf seen by all chunks
+        Kr_iso, Ki_iso = Kd.real, Kd.imag        # differentiable views
+
+        fast = self.fast_kernels and token_batches[0].device.type == "cuda"
+        scan = _SCAN_CHUNK if fast else _scan_chunk_impl
+
+        nll_total = torch.zeros((), dtype=self.rdtype,
+                                device=token_batches[0].device)
+        for tokens in token_batches:
+            B, L = tokens.shape
+            rho = self.initial_rho(B, decohere=decohere)
+            rho_r = rho.real.clone()
+            rho_i = rho.imag.clone()
+            chunk = tbptt if tbptt > 0 else L
+            for start in range(0, L, chunk):
+                tok_c = tokens[:, start:start + chunk]
+                Kr_chunk = Kr_iso[tok_c]         # (B, C, W, n, n) contiguous
+                Ki_chunk = Ki_iso[tok_c]
+                nll_chunk, rho_r, rho_i = scan(
+                    Kr_chunk, Ki_chunk, rho_r, rho_i, eps, decohere, cdtype)
+                (nll_chunk * inv).backward()     # frees THIS chunk's graph
+                nll_total += nll_chunk.detach()
+                rho_r = rho_r.detach()
+                rho_i = rho_i.detach()
+
+        if Kd.grad is not None:
+            K.backward(Kd.grad)                  # projection backward: once
+        return float(nll_total) * inv
+
+
     # ----- generation ------------------------------------------------------------
     @torch.no_grad()
     def generate(self, prompt_ids: list[int] | None, n_new: int,
