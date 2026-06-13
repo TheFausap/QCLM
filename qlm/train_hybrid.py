@@ -16,7 +16,6 @@ from __future__ import annotations
 import os, sys, time, math, argparse
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
-torch.set_float32_matmul_precision('high')
 from qlm.data import CharTokenizer, CharDataset, load_text
 from qlm.hybrid import HybridLM
 
@@ -57,6 +56,10 @@ def main():
     ap.add_argument("--device", default="auto")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--prompt", default="ROMEO:")
+    ap.add_argument("--no_compile", action="store_true",
+                    help="disable torch.compile on the quantum scan (use eager). "
+                         "At small n the compile overhead/recompiles can cost more "
+                         "than they save -- A/B this against the default on your GPU.")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -70,8 +73,13 @@ def main():
     model = HybridLM(tok.vocab_size, n_layers=args.n_layers, n=args.n, W=args.kraus,
                      d_model=args.d_model, n_heads=args.n_heads,
                      block_size=args.block, persist=args.persist).to(dev)
+    if args.no_compile:
+        from qlm.hybrid import QuantumChannelSublayer
+        for mod in model.modules():
+            if isinstance(mod, QuantumChannelSublayer):
+                mod.compile_scan = False
     print(f"device {dev} | persist={args.persist} | params {model.num_params()/1e6:.2f}M "
-          f"| decohere={args.decohere}")
+          f"| decohere={args.decohere} | compile={'off' if args.no_compile else 'on'}")
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95),
                             weight_decay=0.0)
 
