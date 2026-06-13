@@ -73,7 +73,7 @@ def _svd_hermitian(G: torch.Tensor, eps: float = 1e-6):
     n = G.shape[-1]
     G = 0.5 * (G + G.mH)
     I = torch.eye(n, dtype=G.dtype, device=G.device)
-    max_diag = G.diagonal(dim1=-2, dim2=-1).real.abs().max().clamp(min=eps).item()
+    max_diag = G.diagonal().real.abs().max().clamp(min=eps).item()
     alpha = max_diag * 1e-4
     G_reg = G + alpha * I
 
@@ -135,66 +135,50 @@ class _KrausProjection(torch.autograd.Function):
     became ill-conditioned; clipping makes that safe.
     """
 
-    # Vocabulary is processed in chunks of this many tokens so the (chunk,n,n)
-    # complex intermediates in the Loewner backward stay bounded regardless of V.
-    # At n=128/complex64 one (V,n,n) tensor is ~2 GiB for V=16384; the backward
-    # builds ~4 of them simultaneously (grad_G, its adjoint, the sum, the matmul
-    # result) -> 8 GiB in a single expression. Chunking caps that at
-    # chunk/V of the peak. 2048 keeps peak ~1 GiB while still amortising kernel
-    # launches well.
-    VOCAB_CHUNK = 2048
-
     @staticmethod
     def forward(ctx, K: torch.Tensor, eps: float, max_loewner: float) -> torch.Tensor:
         V, W, n, _ = K.shape
-        # PER-TOKEN isometry: each token x must satisfy sum_w K_{x,w}^dag K_{x,w}=I.
-        # G is batched (V, n, n) -- one constraint PER token.
-        Vmat = K.reshape(V, W * n, n)                       # (V, W*n, n)
-        U, evals = _svd_hermitian(Vmat.mH @ Vmat, eps)      # U:(V,n,n) evals:(V,n)
-        G_inv_sqrt = U @ torch.diag_embed((1.0 / evals.sqrt()).to(U.dtype)) @ U.mH
+        Vmat = K.reshape(V * W * n, n)
+        U, evals = _svd_hermitian(Vmat.mH @ Vmat, eps)
+        s = evals.sqrt()
+        G_inv_sqrt = U @ torch.diag_embed((1.0 / s).to(U.dtype)) @ U.mH
         K_iso = (Vmat @ G_inv_sqrt).reshape(V, W, n, n)
-        # Save ONLY the small spectral factors (U ~2 GiB, evals tiny) plus the
-        # input K (already resident as the parameter, so a reference is free).
-        # Vmat and G_inv_sqrt (8+2 GiB) are recomputed per slice in backward.
-        ctx.save_for_backward(K.detach(), U, evals)
+        ctx.save_for_backward(Vmat.detach(), U, evals, G_inv_sqrt.detach())
         ctx.shape = (V, W, n)
-        ctx.eps = eps
         ctx.max_loewner = max_loewner
         return K_iso
 
     @staticmethod
     def backward(ctx, grad_K_iso: torch.Tensor):
-        K, U, evals = ctx.saved_tensors
+        Vmat, U, evals, G_inv_sqrt = ctx.saved_tensors
         V, W, n = ctx.shape
-        ml = ctx.max_loewner
-        grad_K_iso = grad_K_iso.reshape(V, W * n, n).to(K.dtype)  # (V, W*n, n)
-        grad_Vmat = torch.empty(V, W * n, n, dtype=K.dtype, device=K.device)
-        K_flat = K.reshape(V, W * n, n)
 
-        # Vocabulary processed in slices; the (chunk,n,n) complex temporaries
-        # never materialise all V at once. Per-slice math is identical to the
-        # batched form (tokens are independent). Recomputing Vmat/G_inv_sqrt per
-        # slice from K+U+evals avoids saving the two 8 GiB / 2 GiB full tensors.
-        step = _KrausProjection.VOCAB_CHUNK
-        for a in range(0, V, step):
-            b = min(a + step, V)
-            Vm = K_flat[a:b]; Uc = U[a:b]; ev = evals[a:b]
-            gflat = grad_K_iso[a:b]
-            Gis = Uc @ torch.diag_embed((1.0 / ev.sqrt()).to(Uc.dtype)) @ Uc.mH
+        grad_flat = grad_K_iso.reshape(V * W * n, n).to(Vmat.dtype)
 
-            # Direct path: grad_Vm = gflat @ G_inv_sqrt† (Hermitian)
-            gVm = gflat @ Gis
+        # ── Direct path: K_iso = Vmat @ G_inv_sqrt ────────────────────────────
+        # grad_Vmat += grad_flat @ G_inv_sqrt†  (G_inv_sqrt is Hermitian)
+        grad_Vmat = grad_flat @ G_inv_sqrt
 
-            # G path
-            P = Vm.mH @ gflat                                   # (chunk, n, n)
-            sqrt_s = ev.float().sqrt()                          # (chunk, n)
-            si = sqrt_s.unsqueeze(-1); sj = sqrt_s.unsqueeze(-2)
-            L = (-1.0 / (si * sj * (si + sj)).clamp(min=1e-10)).clamp(min=-ml)
-            M = Uc.mH @ P @ Uc                                  # (chunk, n, n)
-            M_sym = 0.5 * (M + M.mH)
-            grad_G = Uc @ (L.to(Uc.dtype) * M_sym) @ Uc.mH      # (chunk, n, n)
-            gVm = gVm + Vm @ (grad_G + grad_G.mH)
-            grad_Vmat[a:b] = gVm
+        # ── G path: G = Vmat†Vmat → G_inv_sqrt → K_iso = Vmat @ G_inv_sqrt ───
+        # Incoming gradient to G_inv_sqrt: P = Vmat† grad_flat  (n × n)
+        P = Vmat.mH @ grad_flat   # (n, n)
+
+        # Loewner matrix for f(s) = 1/sqrt(s):
+        #   L_ij = (f(si) − f(sj)) / (si − sj)  →  −1 / (√si · √sj · (√si + √sj))
+        #   diagonal limit  L_ii = f′(si) = −1 / (2 · si^{3/2})
+        sqrt_s = evals.float().sqrt()                        # (n,)
+        si = sqrt_s.unsqueeze(-1)                            # (n, 1)
+        sj = sqrt_s.unsqueeze(-2)                            # (1, n)
+        # Both diagonal and off-diagonal share the same closed form:
+        L = (-1.0 / (si * sj * (si + sj)).clamp(min=1e-10)).clamp(min=-ctx.max_loewner)
+
+        # grad_G = U (L * sym(U† P U)) U†
+        M = U.mH @ P @ U                             # (n, n)
+        M_sym = 0.5 * (M + M.mH)
+        grad_G = U @ (L.to(U.dtype) * M_sym) @ U.mH  # (n, n)
+
+        # Backward through G = Vmat†Vmat:  grad_Vmat += Vmat (grad_G + grad_G†)
+        grad_Vmat = grad_Vmat + Vmat @ (grad_G + grad_G.mH)
 
         return grad_Vmat.reshape(V, W, n, n), None, None
 
@@ -322,7 +306,7 @@ class QuantumChannelLM(nn.Module):
             torch.randn(V, W, n, n, dtype=rdtype) * scale,
         )
         with torch.no_grad():
-            Vm = K_raw.reshape(V, W * n, n)   # per-token G (V, n, n)
+            Vm = K_raw.reshape(V * W * n, n)
             K_iso_init = (Vm @ _inv_sqrt_hermitian(Vm.mH @ Vm)).reshape(V, W, n, n)
         self.Kr = nn.Parameter(K_iso_init.real.contiguous())
         self.Ki = nn.Parameter(K_iso_init.imag.contiguous())
@@ -356,7 +340,7 @@ class QuantumChannelLM(nn.Module):
         """
         K = torch.complex(self.Kr, self.Ki)
         V, W, n, _ = K.shape
-        Vmat = K.reshape(V, W * n, n)   # per-token G (V, n, n)
+        Vmat = K.reshape(V * W * n, n)
         K_iso = (Vmat @ _inv_sqrt_hermitian(Vmat.mH @ Vmat)).reshape(V, W, n, n)
         self.Kr.copy_(K_iso.real)
         self.Ki.copy_(K_iso.imag)

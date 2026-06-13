@@ -103,14 +103,13 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--resume", default="", metavar="CKPT",
                     help="path to a _crash / _last checkpoint to resume from")
-    ap.add_argument("--reproject_every", type=int, default=200,
-                    help="every N optimizer steps, snap Kr/Ki back onto the per-token "
-                         "isometry manifold. The forward _KrausProjection already "
-                         "projects every token every forward pass, so the MODEL is "
-                         "always on-manifold; this only re-normalises the stored "
-                         "parametrisation to prevent slow numerical drift in storage. "
-                         "Cheap hygiene, NOT needed every step (a full-vocab batched "
-                         "eigh is expensive). 0=off")
+    ap.add_argument("--reproject_every", type=int, default=1,
+                    help="every N optimizer steps, snap Kr/Ki back onto the isometry "
+                         "manifold (exactly function-preserving retraction, ~0.1s). "
+                         "The projection is scale-invariant, so Adam steps inflate "
+                         "||V|| monotonically and shrink the EFFECTIVE lr by 1/||V||; "
+                         "retracting every step (Riemannian Adam) prevents this and "
+                         "keeps the Loewner backward well-conditioned. 0=off")
     ap.add_argument("--keep_opt", action="store_true",
                     help="also load optimizer state on --resume. ONLY safe if the "
                          "checkpoint was saved by this exact code version: Adam moments "
@@ -255,24 +254,21 @@ def main():
                 continue
             opt.step()
             if args.reproject_every and (step + 1) % args.reproject_every == 0:
-                # Per-token conditioning telemetry: G is (V, n, n), one per token.
-                # Report the WORST per-token conditioning across the vocab (the
-                # global reshape would just give V*I -> eigenvalues == V, which is
-                # meaningless). Then re-normalise the stored parametrisation.
+                # Log G's spectrum BEFORE retraction (this is the drift telemetry),
+                # then snap back onto the manifold. The model's function is unchanged.
                 with torch.no_grad():
-                    Vt = torch.complex(model.Kr, model.Ki).reshape(
-                        model.Kr.shape[0], -1, model.n)         # (V, W*n, n)
-                    G = Vt.mH @ Vt                              # (V, n, n)
-                    s = torch.linalg.eigvalsh(G).real           # (V, n)
-                    g_min = s.min().item(); g_max = s.max().item()
+                    Vm = torch.complex(model.Kr, model.Ki).reshape(-1, model.n)
+                    s = torch.linalg.eigvalsh(Vm.mH @ Vm).real
+                    g_min, g_max = s.min().item(), s.max().item()
                 model.reproject_()
                 cond = g_max / max(g_min, 1e-12)
-                if cond > 10.0:
-                    print(f"   [reproject] step {step+1}: worst per-token G eigs "
-                          f"[{g_min:.3e}, {g_max:.3e}] cond {cond:.1f} -> renormalised")
-                logf.write(json.dumps({"type": "reproject", "step": step + 1,
-                                       "G_min": g_min, "G_max": g_max,
-                                       "G_cond": cond}) + "\n"); logf.flush()
+                if cond > 10.0 or g_max > 4.0 or g_min < 0.25:
+                    print(f"   [reproject] step {step+1}: G eigs [{g_min:.3e}, {g_max:.3e}] "
+                          f"cond {cond:.1f} -> 1")
+                if (step + 1) % 20 == 0:
+                    logf.write(json.dumps({"type": "reproject", "step": step + 1,
+                                           "G_min": g_min, "G_max": g_max,
+                                           "G_cond": cond}) + "\n"); logf.flush()
 
             if (step + 1) % 20 == 0:
                 tr_bits = (run_nll / run_tok) / LN2; run_nll, run_tok = 0.0, 0
