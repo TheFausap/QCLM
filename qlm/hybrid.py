@@ -170,6 +170,67 @@ except Exception:  # very old torch: no sdpa_kernel context manager
             q, k, v, is_causal=is_causal, dropout_p=dropout_p)
 
 
+class QuantumAttention(nn.Module):
+    """Born-rule attention: routing governed by quantum-state overlap.
+
+    Each position emits a per-head PURE state |psi> in C^{n_q} (learned linear
+    projection of the input, split into real/imag and L2-normalised). The
+    attention score between positions i and j is the Born-rule transition
+    probability
+
+        s_ij = |<psi_i | psi_j>|^2 = Tr(rho_i rho_j),   rho = |psi><psi|
+
+    a genuine probability in [0,1]. Scores are causally masked and sum-normalised
+    into mixing weights over ordinary real value vectors. The ONLY quantum element
+    is the routing kernel -- values and the output projection are classical -- so
+    a comparison against dot-product attention isolates the routing mechanism.
+
+    Decoherence ablation (decohere=True): zero the off-diagonals of each rho, i.e.
+    score becomes sum_k |a_ik|^2 |a_jk|^2 -- the classical kernel with the
+    interference cross-terms removed EXACTLY. The intact-minus-decohered gap is,
+    by construction, precisely the contribution of quantum interference to routing.
+    """
+
+    def __init__(self, d_model, n_heads, n_q=16):
+        super().__init__()
+        assert d_model % n_heads == 0
+        self.h = n_heads
+        self.n_q = n_q
+        self.dh = d_model // n_heads
+        # per-head pure-state amplitudes: real and imag, each (d_model -> h*n_q)
+        self.to_state = nn.Linear(d_model, 2 * n_heads * n_q)
+        self.to_v = nn.Linear(d_model, d_model)
+        self.proj = nn.Linear(d_model, d_model)
+
+    def forward(self, x, decohere=False):
+        B, L, D = x.shape
+        s = self.to_state(x).view(B, L, self.h, 2, self.n_q)
+        psi_r, psi_i = s[..., 0, :], s[..., 1, :]          # (B,L,h,n_q)
+        psi_r = psi_r.permute(0, 2, 1, 3)                  # (B,h,L,n_q)
+        psi_i = psi_i.permute(0, 2, 1, 3)
+        psi = torch.complex(psi_r, psi_i)
+        psi = psi / (psi.norm(dim=-1, keepdim=True) + 1e-8)  # normalise -> pure state
+
+        if decohere:
+            # classical kernel: sum_k |a_ik|^2 |a_jk|^2  (off-diagonals zeroed)
+            p = psi.abs().pow(2)                            # (B,h,L,n_q)
+            scores = torch.einsum('bhik,bhjk->bhij', p, p)  # (B,h,L,L)
+        else:
+            # Born overlap |<psi_i|psi_j>|^2
+            ov = torch.einsum('bhik,bhjk->bhij', psi.conj(), psi)  # complex (B,h,L,L)
+            scores = (ov.conj() * ov).real
+
+        # causal mask + sum-normalise (scores are similarities in [0,1], not logits)
+        mask = torch.tril(torch.ones(L, L, device=x.device, dtype=torch.bool))
+        scores = scores.masked_fill(~mask, 0.0)
+        w = scores / scores.sum(-1, keepdim=True).clamp_min(1e-8)  # (B,h,L,L)
+
+        v = self.to_v(x).view(B, L, self.h, self.dh).transpose(1, 2)  # (B,h,L,dh)
+        y = torch.einsum('bhij,bhjd->bhid', w, v)          # (B,h,L,dh)
+        y = y.transpose(1, 2).contiguous().view(B, L, D)
+        return self.proj(y)
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, d_model, n_heads, dropout=0.0):
         super().__init__()
@@ -179,7 +240,7 @@ class CausalSelfAttention(nn.Module):
         self.proj = nn.Linear(d_model, d_model)
         self.drop = dropout
 
-    def forward(self, x):
+    def forward(self, x, decohere=False):  # decohere arg ignored (classical attn)
         B, L, D = x.shape
         q, k, v = self.qkv(x).split(D, dim=2)
         q = q.view(B, L, self.h, D // self.h).transpose(1, 2)
@@ -192,14 +253,21 @@ class CausalSelfAttention(nn.Module):
 
 
 class Block(nn.Module):
-    """quantum sublayer -> attn -> MLP, each with prenorm + residual."""
+    """quantum sublayer -> attn -> MLP, each with prenorm + residual.
 
-    def __init__(self, vocab_size, n, W, d_model, n_heads):
+    attn_kind: 'dot' = ordinary dot-product attention (rung 2);
+               'born' = Born-rule quantum attention (rung 3).
+    """
+
+    def __init__(self, vocab_size, n, W, d_model, n_heads, attn_kind="dot", n_q=16):
         super().__init__()
         self.ln_q = nn.LayerNorm(d_model)
         self.q = QuantumChannelSublayer(vocab_size, n, W, d_model)
         self.ln_a = nn.LayerNorm(d_model)
-        self.attn = CausalSelfAttention(d_model, n_heads)
+        if attn_kind == "born":
+            self.attn = QuantumAttention(d_model, n_heads, n_q=n_q)
+        else:
+            self.attn = CausalSelfAttention(d_model, n_heads)
         self.ln_m = nn.LayerNorm(d_model)
         self.mlp = nn.Sequential(nn.Linear(d_model, 4 * d_model), nn.GELU(),
                                  nn.Linear(4 * d_model, d_model))
@@ -209,14 +277,16 @@ class Block(nn.Module):
         # the attention/MLP refine the d_model stream. Residual around the q readout.
         q_out, rho_final = self.q(tokens, rho0=rho0, decohere=decohere)
         x = x + q_out
-        x = x + self.attn(self.ln_a(x))
+        x = x + self.attn(self.ln_a(x), decohere=decohere)
         x = x + self.mlp(self.ln_m(x))
         return x, rho_final
 
 
+
 class HybridLM(nn.Module):
     def __init__(self, vocab_size, n_layers=4, n=32, W=4, d_model=256,
-                 n_heads=8, block_size=256, persist="fresh"):
+                 n_heads=8, block_size=256, persist="fresh",
+                 attn_kind="dot", n_q=16):
         super().__init__()
         self.vocab_size = vocab_size
         self.block_size = block_size
@@ -224,7 +294,8 @@ class HybridLM(nn.Module):
         self.tok_emb = nn.Embedding(vocab_size, d_model)
         self.pos_emb = nn.Parameter(torch.zeros(1, block_size, d_model))
         self.blocks = nn.ModuleList(
-            [Block(vocab_size, n, W, d_model, n_heads) for _ in range(n_layers)])
+            [Block(vocab_size, n, W, d_model, n_heads, attn_kind=attn_kind, n_q=n_q)
+             for _ in range(n_layers)])
         self.ln_f = nn.LayerNorm(d_model)
         self.head = nn.Linear(d_model, vocab_size, bias=False)
         self.head.weight = self.tok_emb.weight  # weight tying

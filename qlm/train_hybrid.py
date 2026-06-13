@@ -40,6 +40,14 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", default=os.path.join(HERE, "data", "tinyshakespeare.txt"))
     ap.add_argument("--persist", choices=["fresh", "thread"], default="fresh")
+    ap.add_argument("--attn", choices=["dot", "born"], default="dot",
+                    help="attention routing kernel. 'dot' = ordinary dot-product "
+                         "(rung 2). 'born' = Born-rule quantum attention, scores = "
+                         "|<psi_i|psi_j>|^2 (rung 3); --decohere then removes the "
+                         "interference cross-terms from the ROUTING, isolating the "
+                         "quantum contribution to long-range mixing.")
+    ap.add_argument("--n_q", type=int, default=16,
+                    help="per-head pure-state dimension for Born attention")
     ap.add_argument("--n_layers", type=int, default=4)
     ap.add_argument("--n", type=int, default=32, help="Hilbert dim per quantum sublayer")
     ap.add_argument("--kraus", type=int, default=4)
@@ -72,13 +80,15 @@ def main():
 
     model = HybridLM(tok.vocab_size, n_layers=args.n_layers, n=args.n, W=args.kraus,
                      d_model=args.d_model, n_heads=args.n_heads,
-                     block_size=args.block, persist=args.persist).to(dev)
+                     block_size=args.block, persist=args.persist,
+                     attn_kind=args.attn, n_q=args.n_q).to(dev)
     if args.no_compile:
         from qlm.hybrid import QuantumChannelSublayer
         for mod in model.modules():
             if isinstance(mod, QuantumChannelSublayer):
                 mod.compile_scan = False
-    print(f"device {dev} | persist={args.persist} | params {model.num_params()/1e6:.2f}M "
+    print(f"device {dev} | persist={args.persist} | attn={args.attn} "
+          f"| params {model.num_params()/1e6:.2f}M "
           f"| decohere={args.decohere} | compile={'off' if args.no_compile else 'on'}")
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95),
                             weight_decay=0.0)
