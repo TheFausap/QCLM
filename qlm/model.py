@@ -602,7 +602,8 @@ class QuantumChannelLM(nn.Module):
     def generate(self, prompt_ids: list[int] | None, n_new: int,
                  temperature: float = 1.0, top_k: int | None = None,
                  decohere: bool = False, seed: int | None = None) -> list[int]:
-        g = torch.Generator().manual_seed(seed) if seed is not None else None
+        dev = self.psi0_r.device
+        g = torch.Generator(device=dev).manual_seed(seed) if seed is not None else None
         K = self.kraus_operators()
         M = self.povm(K)
         rho = self.initial_rho(1, decohere=decohere)               # (1, n, n)
