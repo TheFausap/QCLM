@@ -16,6 +16,7 @@ from __future__ import annotations
 import os, sys, time, math, argparse
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
+torch.set_float32_matmul_precision('high')
 from qlm.data import CharTokenizer, CharDataset, load_text
 from qlm.hybrid import HybridLM
 
