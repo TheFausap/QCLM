@@ -48,6 +48,40 @@ from qlm.model import _KrausProjection, _cplx_mm_block, _cplx_mm_dag_block
 
 
 # ───────────────────────── quantum-channel sublayer ─────────────────────────
+def _qfeat_scan_impl(Kr_seq, Ki_seq, rho_r, rho_i, eps, decohere):
+    """Per-token Kraus scan emitting the rho readout features at EVERY position.
+
+    Kr_seq/Ki_seq: (B, L, W, n, n) float32 (pre-gathered per-token Kraus ops).
+    Returns feats (B, L, 2*n*n): [Re(rho).flatten(), Im(rho).flatten()] per step,
+    plus the final (rho_r, rho_i). No .item()/Python-scalar ops, so torch.compile
+    can fuse the unrolled loop into a few Triton kernels (same trick as the base
+    model's _SCAN_CHUNK, but emitting features instead of NLL).
+    """
+    B, L = Kr_seq.shape[0], Kr_seq.shape[1]
+    n = rho_r.shape[-1]
+    feats = []
+    for t in range(L):
+        Kr_x = Kr_seq[:, t]; Ki_x = Ki_seq[:, t]            # (B,W,n,n)
+        Krho_r, Krho_i = _cplx_mm_block(Kr_x, Ki_x,
+                                        rho_r.unsqueeze(1), rho_i.unsqueeze(1),
+                                        torch.float32)
+        E_r, E_i = _cplx_mm_dag_block(Krho_r, Krho_i, Kr_x, Ki_x, torch.float32)
+        E_r = E_r.sum(1); E_i = E_i.sum(1)                  # (B,n,n)
+        p = E_r.diagonal(dim1=-2, dim2=-1).sum(-1).clamp_min(eps)
+        rho_r = E_r / p[:, None, None]
+        rho_i = E_i / p[:, None, None]
+        if decohere:
+            d = rho_r.diagonal(dim1=-2, dim2=-1)
+            rho_r = torch.diag_embed(d)
+            rho_i = torch.zeros_like(rho_r)
+            rho_r = rho_r / d.sum(-1).clamp_min(eps)[:, None, None]
+        feats.append(torch.cat([rho_r.reshape(B, -1), rho_i.reshape(B, -1)], -1))
+    return torch.stack(feats, 1), rho_r, rho_i   # (B,L,2*n*n)
+
+
+_QFEAT_SCAN = torch.compile(_qfeat_scan_impl, fullgraph=True, dynamic=False)
+
+
 class QuantumChannelSublayer(nn.Module):
     """Per-token Kraus channel producing a per-position readout of rho.
 
@@ -59,10 +93,11 @@ class QuantumChannelSublayer(nn.Module):
     """
 
     def __init__(self, vocab_size: int, n: int, W: int, d_model: int,
-                 rdtype=torch.float32):
+                 rdtype=torch.float32, compile_scan: bool = True):
         super().__init__()
         self.V, self.n, self.W = vocab_size, n, W
         self.rdtype = rdtype
+        self.compile_scan = compile_scan
         scale = 1.0 / math.sqrt(vocab_size * W * n)
         K_raw = torch.complex(torch.randn(vocab_size, W, n, n) * scale,
                               torch.randn(vocab_size, W, n, n) * scale)
@@ -76,6 +111,14 @@ class QuantumChannelSublayer(nn.Module):
         self.psi0_r = nn.Parameter(torch.randn(n) / math.sqrt(n))
         self.psi0_i = nn.Parameter(torch.randn(n) / math.sqrt(n))
         self.readout = nn.Linear(2 * n * n, d_model)
+        # Tame the readout: the 2n^2 vectorised-rho features have entries O(1/n)
+        # but there are 2n^2 of them, so default init produces large logits and a
+        # hot, unstable start (train loss spiking into the hundreds early). Scale
+        # the readout weights down so the initial block output is O(1), matching
+        # the residual stream, and let training grow it if useful.
+        with torch.no_grad():
+            self.readout.weight.mul_(1.0 / math.sqrt(2 * n * n))
+            self.readout.bias.zero_()
 
     def kraus(self):
         K = torch.complex(self.Kr, self.Ki)
@@ -95,30 +138,15 @@ class QuantumChannelSublayer(nn.Module):
         B, L = tokens.shape
         dev = tokens.device
         K = self.kraus()                              # (V,W,n,n)
-        Kr_seq = K.real[tokens]                       # (B,L,W,n,n)
-        Ki_seq = K.imag[tokens]
+        Kr_seq = K.real[tokens].contiguous()          # (B,L,W,n,n)
+        Ki_seq = K.imag[tokens].contiguous()
         rho = self.initial_rho(B, dev, decohere) if rho0 is None else rho0
         rho_r, rho_i = rho.real.contiguous(), rho.imag.contiguous()
         eps = 1e-6
-        outs = []
-        for t in range(L):
-            Kr_x, Ki_x = Kr_seq[:, t], Ki_seq[:, t]   # (B,W,n,n)
-            Krho_r, Krho_i = _cplx_mm_block(Kr_x, Ki_x,
-                                            rho_r.unsqueeze(1), rho_i.unsqueeze(1),
-                                            torch.float32)
-            E_r, E_i = _cplx_mm_dag_block(Krho_r, Krho_i, Kr_x, Ki_x, torch.float32)
-            E_r, E_i = E_r.sum(1), E_i.sum(1)         # (B,n,n)
-            p = E_r.diagonal(dim1=-2, dim2=-1).sum(-1).clamp_min(eps)  # (B,)
-            rho_r = E_r / p[:, None, None]
-            rho_i = E_i / p[:, None, None]
-            if decohere:
-                d = rho_r.diagonal(dim1=-2, dim2=-1)
-                rho_r = torch.diag_embed(d)
-                rho_i = torch.zeros_like(rho_r)
-                rho_r = rho_r / d.sum(-1).clamp_min(eps)[:, None, None]
-            feat = torch.cat([rho_r.reshape(B, -1), rho_i.reshape(B, -1)], -1)
-            outs.append(self.readout(feat))
-        out = torch.stack(outs, 1)                    # (B,L,d_model)
+        scan = _QFEAT_SCAN if (self.compile_scan and dev.type == "cuda") \
+            else _qfeat_scan_impl
+        feats, rho_r, rho_i = scan(Kr_seq, Ki_seq, rho_r, rho_i, eps, decohere)
+        out = self.readout(feats)                     # one (B,L,2n^2)->(B,L,d_model) matmul
         return out, torch.complex(rho_r, rho_i)
 
 
@@ -201,6 +229,23 @@ class HybridLM(nn.Module):
         self.head = nn.Linear(d_model, vocab_size, bias=False)
         self.head.weight = self.tok_emb.weight  # weight tying
         self.n = n
+        # GPT-2-style init: small embedding so the weight-tied logits start at a
+        # sane scale (with std~1 residual and std~1 tied head over d_model dims,
+        # default init gives logit std ~sqrt(d_model) -> loss in the dozens). Also
+        # scale residual-projection layers by 1/sqrt(2*n_layers) for stable depth.
+        self.apply(self._init_weights)
+        for nm, p in self.named_parameters():
+            if nm.endswith("proj.weight") or nm.endswith("mlp.2.weight"):
+                torch.nn.init.normal_(p, mean=0.0,
+                                      std=0.02 / math.sqrt(2 * n_layers))
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, targets=None, decohere=False):
         B, L = idx.shape
