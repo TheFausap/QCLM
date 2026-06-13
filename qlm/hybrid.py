@@ -123,6 +123,25 @@ class QuantumChannelSublayer(nn.Module):
 
 
 # ───────────────────────────── attention + MLP ──────────────────────────────
+# On some GPUs (e.g. GB10 / sm121) the cutlass memory-efficient SDPA kernel has
+# no build for the chip and aborts with a FATAL kernel-mismatch. Prefer the
+# flash and math backends, which do have builds, and exclude mem-efficient.
+try:
+    from torch.nn.attention import sdpa_kernel, SDPBackend
+    _SDPA_BACKENDS = [SDPBackend.FLASH_ATTENTION, SDPBackend.MATH]
+
+    def _sdpa(q, k, v, is_causal, dropout_p):
+        # set_priority isn't available everywhere; passing a list selects the
+        # allowed backends (tried in order) and disables the rest.
+        with sdpa_kernel(_SDPA_BACKENDS):
+            return F.scaled_dot_product_attention(
+                q, k, v, is_causal=is_causal, dropout_p=dropout_p)
+except Exception:  # very old torch: no sdpa_kernel context manager
+    def _sdpa(q, k, v, is_causal, dropout_p):
+        return F.scaled_dot_product_attention(
+            q, k, v, is_causal=is_causal, dropout_p=dropout_p)
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, d_model, n_heads, dropout=0.0):
         super().__init__()
@@ -138,8 +157,8 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, L, self.h, D // self.h).transpose(1, 2)
         k = k.view(B, L, self.h, D // self.h).transpose(1, 2)
         v = v.view(B, L, self.h, D // self.h).transpose(1, 2)
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True,
-                                           dropout_p=self.drop if self.training else 0.0)
+        y = _sdpa(q, k, v, is_causal=True,
+                  dropout_p=self.drop if self.training else 0.0)
         y = y.transpose(1, 2).contiguous().view(B, L, D)
         return self.proj(y)
 
