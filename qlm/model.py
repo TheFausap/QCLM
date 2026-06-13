@@ -327,6 +327,30 @@ class QuantumChannelLM(nn.Module):
         K = torch.complex(self.Kr, self.Ki)
         return _KrausProjection.apply(K, 1e-6, 1e4)
 
+    def conditioning_penalty(self) -> torch.Tensor:
+        """Tikhonov-style regulariser ||G - I||_F^2 on the GLOBAL POVM operator
+        G = sum_{x,w} K_{x,w}^dag K_{x,w} = Vmat^H Vmat  (Vmat = K reshaped to
+        (V*W*n, n)).  Returns a real scalar.
+
+        Why this and not (G + lambda I)^{-1/2} in the projection: the exact
+        projection must be preserved so that sum_x M_x = I (a valid next-token
+        distribution); folding lambda into the inverse-sqrt breaks completeness.
+        Instead we leave the projection exact and ADD a loss term that discourages
+        G from drifting away from I -- pushing every eigenvalue toward 1, which
+        simultaneously prevents the near-singularity that blew up the Loewner
+        backward (min eig -> 0) and the norm inflation (max eig -> large).
+
+        Self-disabling: at init / when healthy G ~= I so the penalty ~= 0; it only
+        activates as G degrades. Computed with matmuls only (no eigendecomp), so
+        it is cheap. Gradient flows to the RAW Kr/Ki (not through the projection).
+        """
+        V, W, n, _ = self.Kr.shape
+        K = torch.complex(self.Kr, self.Ki)
+        Vmat = K.reshape(V * W * n, n)
+        G = Vmat.mH @ Vmat
+        I = torch.eye(n, dtype=G.dtype, device=G.device)
+        return ((G - I).abs() ** 2).sum()
+
     @torch.no_grad()
     def reproject_(self) -> None:
         """Snap Kr/Ki onto the isometry manifold. Does NOT change the model.

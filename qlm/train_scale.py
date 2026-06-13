@@ -91,6 +91,13 @@ def main():
                     help="AdamW weight decay (0 = off; rare-token operators get no gradient so "
                          "positive wd drives them to zero and worsens G conditioning)")
     ap.add_argument("--warmup", type=int, default=2000)
+    ap.add_argument("--cond_penalty", type=float, default=0.0,
+                    help="coefficient for the Tikhonov conditioning penalty "
+                         "lambda*||G - I||_F^2 on the global POVM operator "
+                         "G = sum_{x,w} K^dag K. 0 = off. ~1e-3 keeps G near I "
+                         "(prevents the near-singular G that blows up the Loewner "
+                         "backward) without touching the exact projection / "
+                         "completeness. Self-disabling when G is healthy.")
     ap.add_argument("--clip", type=float, default=1.0)
     # infra
     ap.add_argument("--device", default="auto")
@@ -246,6 +253,12 @@ def main():
             mean_nll = model.training_step(batches, tbptt=args.tbptt)
             ntok = sum(int(b.numel()) for b in batches)
             run_nll += mean_nll * ntok; run_tok += ntok; seen_tok += ntok
+            if args.cond_penalty:
+                # Add lambda*||G-I||_F^2 gradient on top of the NLL gradient that
+                # training_step already accumulated. Backward adds into .grad, so
+                # this composes correctly with the projection's gradient. Penalty
+                # is ~0 (and gradient ~0) while G is healthy.
+                (args.cond_penalty * model.conditioning_penalty()).backward()
             gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
             if torch.isnan(gnorm) or torch.isinf(gnorm):
                 print(f"step {step+1}: NaN/Inf gnorm — skipping optimizer step")
