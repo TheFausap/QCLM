@@ -150,9 +150,75 @@ class QuantumChannelSublayer(nn.Module):
         return out, torch.complex(rho_r, rho_i)
 
 
-# ───────────────────────────── attention + MLP ──────────────────────────────
-# On some GPUs (e.g. GB10 / sm121) the cutlass memory-efficient SDPA kernel has
-# no build for the chip and aborts with a FATAL kernel-mismatch. Prefer the
+def negativity(rho_r, rho_i, d1, d2):
+    """Entanglement negativity N = (||rho^{T_B}||_1 - 1)/2 across the d1|d2 split.
+    Zero for separable (mixed or pure) states, positive for entangled ones. This
+    is the CORRECT mixed-state entanglement measure -- reduced-state entropy is
+    NOT (it conflates entanglement with classical mixedness). Batched over (B,...).
+    """
+    rho = torch.complex(rho_r, rho_i)
+    B = rho.shape[0]
+    R = rho.reshape(B, d1, d2, d1, d2)
+    RTB = R.permute(0, 1, 4, 3, 2).reshape(B, d1 * d2, d1 * d2)  # partial transpose on B
+    ev = torch.linalg.eigvalsh(0.5 * (RTB + RTB.mH)).real
+    return ((ev.abs().sum(-1) - 1.0) / 2.0)                       # (B,)
+
+
+class BipartiteChannelSublayer(QuantumChannelSublayer):
+    """Quantum channel on a TENSOR-PRODUCT space C^{d1} (x) C^{d2}, n = d1*d2.
+
+    Two parametrisations of the per-token Kraus operators, at matched param budget:
+
+      factorize=False (ENTANGLING): general n x n Kraus -> can create entanglement
+        across the d1|d2 split (this is the base QuantumChannelSublayer).
+
+      factorize=True (PRODUCT): Kraus restricted to the all-pairs tensor product
+        {K1_a (x) K2_b}_{a=1..Wa, b=1..Wb}. Such a channel provably maps separable
+        states to separable states -- it CANNOT create entanglement. With Wa*Wb=W
+        the two configs have ~matched Kraus count; param count differs (product has
+        far fewer free params: Wa*d1^2 + Wb*d2^2 vs W*n^2), so for a fair capacity
+        control we MATCH PARAMS by giving the product config more Kraus pairs (see
+        train flag). The entangling-minus-product VAL gap, together with the
+        negativity trajectory, isolates the value of entanglement.
+    """
+
+    def __init__(self, vocab_size, d1, d2, Wa, Wb, d_model,
+                 factorize=False, compile_scan=True):
+        n = d1 * d2
+        W = Wa * Wb
+        # init the parent with the FULL (V,W,n,n) general Kraus (entangling path);
+        # for the product path we override Kr/Ki with kron-structured params.
+        super().__init__(vocab_size, n, W, d_model, compile_scan=compile_scan)
+        self.d1, self.d2, self.Wa, self.Wb = d1, d2, Wa, Wb
+        self.factorize = factorize
+        if factorize:
+            # per-token factor operators; the (V,W,n,n) Kraus is BUILT from these
+            # every forward as all-pairs krons, so the channel is product by
+            # construction and gradients only ever reach the factor params.
+            s1 = 1.0 / math.sqrt(vocab_size * Wa * d1)
+            s2 = 1.0 / math.sqrt(vocab_size * Wb * d2)
+            self.K1r = nn.Parameter(torch.randn(vocab_size, Wa, d1, d1) * s1)
+            self.K1i = nn.Parameter(torch.randn(vocab_size, Wa, d1, d1) * s1)
+            self.K2r = nn.Parameter(torch.randn(vocab_size, Wb, d2, d2) * s2)
+            self.K2i = nn.Parameter(torch.randn(vocab_size, Wb, d2, d2) * s2)
+            # the parent's general Kr/Ki are unused in the product path; free them
+            del self.Kr, self.Ki
+
+    def kraus(self):
+        if not self.factorize:
+            return super().kraus()                    # general entangling Kraus
+        # build all-pairs product Kraus {K1_a (x) K2_b}, then project onto the
+        # global isometry manifold (sum_{x,w} K^dag K = I) as usual.
+        V, Wa, d1, _ = self.K1r.shape
+        Wb, d2 = self.K2r.shape[1], self.K2r.shape[2]
+        K1 = torch.complex(self.K1r, self.K1i)        # (V,Wa,d1,d1)
+        K2 = torch.complex(self.K2r, self.K2i)        # (V,Wb,d2,d2)
+        # kron over the operator-pair axis: result (V, Wa*Wb, d1*d2, d1*d2)
+        # einsum builds (V,Wa,Wb,d1,d2,d1,d2) then reshapes to (V, Wa*Wb, n, n)
+        Kp = torch.einsum('vaij,vbkl->vabikjl', K1, K2)
+        n = d1 * d2
+        Kp = Kp.reshape(V, Wa * Wb, n, n)
+        return _KrausProjection.apply(Kp, 1e-6, 1e4)
 # flash and math backends, which do have builds, and exclude mem-efficient.
 try:
     from torch.nn.attention import sdpa_kernel, SDPBackend
@@ -259,10 +325,15 @@ class Block(nn.Module):
                'born' = Born-rule quantum attention (rung 3).
     """
 
-    def __init__(self, vocab_size, n, W, d_model, n_heads, attn_kind="dot", n_q=16):
+    def __init__(self, vocab_size, n, W, d_model, n_heads, attn_kind="dot", n_q=16,
+                 bipartite=False, d1=0, d2=0, Wa=0, Wb=0, factorize=False):
         super().__init__()
         self.ln_q = nn.LayerNorm(d_model)
-        self.q = QuantumChannelSublayer(vocab_size, n, W, d_model)
+        if bipartite:
+            self.q = BipartiteChannelSublayer(vocab_size, d1, d2, Wa, Wb, d_model,
+                                              factorize=factorize)
+        else:
+            self.q = QuantumChannelSublayer(vocab_size, n, W, d_model)
         self.ln_a = nn.LayerNorm(d_model)
         if attn_kind == "born":
             self.attn = QuantumAttention(d_model, n_heads, n_q=n_q)
@@ -286,7 +357,8 @@ class Block(nn.Module):
 class HybridLM(nn.Module):
     def __init__(self, vocab_size, n_layers=4, n=32, W=4, d_model=256,
                  n_heads=8, block_size=256, persist="fresh",
-                 attn_kind="dot", n_q=16):
+                 attn_kind="dot", n_q=16,
+                 bipartite=False, d1=0, d2=0, Wa=0, Wb=0, factorize=False):
         super().__init__()
         self.vocab_size = vocab_size
         self.block_size = block_size
@@ -294,7 +366,8 @@ class HybridLM(nn.Module):
         self.tok_emb = nn.Embedding(vocab_size, d_model)
         self.pos_emb = nn.Parameter(torch.zeros(1, block_size, d_model))
         self.blocks = nn.ModuleList(
-            [Block(vocab_size, n, W, d_model, n_heads, attn_kind=attn_kind, n_q=n_q)
+            [Block(vocab_size, n, W, d_model, n_heads, attn_kind=attn_kind, n_q=n_q,
+                   bipartite=bipartite, d1=d1, d2=d2, Wa=Wa, Wb=Wb, factorize=factorize)
              for _ in range(n_layers)])
         self.ln_f = nn.LayerNorm(d_model)
         self.head = nn.Linear(d_model, vocab_size, bias=False)

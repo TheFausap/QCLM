@@ -48,6 +48,18 @@ def main():
                          "quantum contribution to long-range mixing.")
     ap.add_argument("--n_q", type=int, default=16,
                     help="per-head pure-state dimension for Born attention")
+    ap.add_argument("--bipartite", action="store_true",
+                    help="rung 4: quantum state on C^d1 (x) C^d2 (n=d1*d2). Compare "
+                         "--entangle (general Kraus) vs --factorize (product Kraus "
+                         "{K1_a (x) K2_b}, cannot entangle) to isolate the value of "
+                         "entanglement. Logs negativity (the entanglement measure).")
+    ap.add_argument("--d1", type=int, default=8)
+    ap.add_argument("--d2", type=int, default=8)
+    ap.add_argument("--Wa", type=int, default=2)
+    ap.add_argument("--Wb", type=int, default=2)
+    ap.add_argument("--factorize", action="store_true",
+                    help="bipartite: use PRODUCT Kraus (cannot entangle). Omit for "
+                         "the ENTANGLING (general Kraus) config.")
     ap.add_argument("--n_layers", type=int, default=4)
     ap.add_argument("--n", type=int, default=32, help="Hilbert dim per quantum sublayer")
     ap.add_argument("--kraus", type=int, default=4)
@@ -78,10 +90,17 @@ def main():
     train_ds = CharDataset(text, tok, block_size=args.block, split="train", seed=args.seed)
     val_ds = CharDataset(text, tok, block_size=args.block, split="val", seed=args.seed + 1)
 
-    model = HybridLM(tok.vocab_size, n_layers=args.n_layers, n=args.n, W=args.kraus,
-                     d_model=args.d_model, n_heads=args.n_heads,
-                     block_size=args.block, persist=args.persist,
-                     attn_kind=args.attn, n_q=args.n_q).to(dev)
+    if args.bipartite:
+        model = HybridLM(tok.vocab_size, n_layers=args.n_layers, d_model=args.d_model,
+                         n_heads=args.n_heads, block_size=args.block, persist=args.persist,
+                         attn_kind=args.attn, n_q=args.n_q,
+                         bipartite=True, d1=args.d1, d2=args.d2,
+                         Wa=args.Wa, Wb=args.Wb, factorize=args.factorize).to(dev)
+    else:
+        model = HybridLM(tok.vocab_size, n_layers=args.n_layers, n=args.n, W=args.kraus,
+                         d_model=args.d_model, n_heads=args.n_heads,
+                         block_size=args.block, persist=args.persist,
+                         attn_kind=args.attn, n_q=args.n_q).to(dev)
     if args.no_compile:
         from qlm.hybrid import QuantumChannelSublayer
         for mod in model.modules():
@@ -123,6 +142,18 @@ def main():
 
     # ── coherence probe: continue the prompt, watch for on-topic structure ──
     model.eval()
+    if args.bipartite:
+        # measure entanglement actually used: mean negativity of layer-0 final rho
+        from qlm.hybrid import negativity, BipartiteChannelSublayer
+        seqs = val_ds.sample_batch(args.batch).to(dev)
+        with torch.no_grad():
+            blk0 = model.blocks[0].q
+            _, rho = blk0(seqs[:, :-1])
+            neg = negativity(rho.real, rho.imag, args.d1, args.d2)
+        cfg = "PRODUCT (cannot entangle)" if args.factorize else "ENTANGLING (general)"
+        print(f"\n[entanglement] config={cfg} | negativity mean={neg.mean().item():.4f} "
+              f"max={neg.max().item():.4f}")
+        print(f"   (product config should be ~0; entangling >0 IFF the model learned to use it)")
     ids = torch.tensor([tok.encode(args.prompt)], device=dev)
     out = model.generate(ids, n_new=300, temperature=0.7, top_k=20,
                          decohere=args.decohere)
