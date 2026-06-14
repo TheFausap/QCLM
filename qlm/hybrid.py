@@ -219,6 +219,79 @@ class BipartiteChannelSublayer(QuantumChannelSublayer):
         n = d1 * d2
         Kp = Kp.reshape(V, Wa * Wb, n, n)
         return _KrausProjection.apply(Kp, 1e-6, 1e4)
+
+
+def mean_negativity(rho_r, rho_i, dims):
+    """Mean entanglement negativity over the k-1 contiguous bipartitions of a
+    k-factor state on (x)_i C^{dims[i]}. Zero for fully-separable states, positive
+    when entangled across any cut. Generalises bipartite negativity to k factors.
+    """
+    rho = torch.complex(rho_r, rho_i)
+    B = rho.shape[0]; n = rho.shape[-1]
+    k = len(dims)
+    if k < 2:
+        return torch.zeros(B, device=rho.device)
+    negs = []
+    for cut in range(1, k):
+        dL = 1
+        for d in dims[:cut]:
+            dL *= d
+        dR = n // dL
+        R = rho.reshape(B, dL, dR, dL, dR)
+        RTB = R.permute(0, 1, 4, 3, 2).reshape(B, n, n)
+        ev = torch.linalg.eigvalsh(0.5 * (RTB + RTB.mH)).real
+        negs.append((ev.abs().sum(-1) - 1.0) / 2.0)
+    return torch.stack(negs, 0).mean(0)
+
+
+class TensorProductChannelSublayer(QuantumChannelSublayer):
+    """Quantum channel on a k-factor space (x)_i C^{dims[i]}, n = prod(dims).
+
+    Generalises BipartiteChannelSublayer to k factors -- the configuration that
+    tests whether the entanglement advantage GROWS with the number of subsystems.
+
+      factorize=False (ENTANGLING): general n x n Kraus -> can entangle all cuts.
+      factorize=True (PRODUCT): Kraus = all-tuples tensor product, built by
+        iterated einsum; provably cannot entangle across ANY cut. Kraus count =
+        prod(Ws), matched to the entangling W for a same-scan-cost comparison.
+    """
+
+    def __init__(self, vocab_size, dims, Ws, d_model,
+                 factorize=False, compile_scan=True):
+        n = 1
+        for d in dims:
+            n *= d
+        W = 1
+        for w in Ws:
+            W *= w
+        super().__init__(vocab_size, n, W, d_model, compile_scan=compile_scan)
+        self.dims = list(dims)
+        self.Ws = list(Ws)
+        self.factorize = factorize
+        if factorize:
+            self.factor_r = nn.ParameterList()
+            self.factor_i = nn.ParameterList()
+            for d, w in zip(dims, Ws):
+                s = 1.0 / math.sqrt(vocab_size * w * d)
+                self.factor_r.append(nn.Parameter(torch.randn(vocab_size, w, d, d) * s))
+                self.factor_i.append(nn.Parameter(torch.randn(vocab_size, w, d, d) * s))
+            del self.Kr, self.Ki
+
+    def kraus(self):
+        if not self.factorize:
+            return super().kraus()
+        V = self.factor_r[0].shape[0]
+        K = torch.complex(self.factor_r[0], self.factor_i[0])
+        W_acc, n_acc = self.Ws[0], self.dims[0]
+        for idx in range(1, len(self.dims)):
+            Kf = torch.complex(self.factor_r[idx], self.factor_i[idx])
+            Wf, df = self.Ws[idx], self.dims[idx]
+            K = torch.einsum('vaij,vbkl->vabikjl', K, Kf).reshape(
+                V, W_acc * Wf, n_acc * df, n_acc * df)
+            W_acc *= Wf; n_acc *= df
+        return _KrausProjection.apply(K, 1e-6, 1e4)
+
+
 # flash and math backends, which do have builds, and exclude mem-efficient.
 try:
     from torch.nn.attention import sdpa_kernel, SDPBackend
@@ -326,10 +399,14 @@ class Block(nn.Module):
     """
 
     def __init__(self, vocab_size, n, W, d_model, n_heads, attn_kind="dot", n_q=16,
-                 bipartite=False, d1=0, d2=0, Wa=0, Wb=0, factorize=False):
+                 bipartite=False, d1=0, d2=0, Wa=0, Wb=0, factorize=False,
+                 tp=False, dims=None, Ws=None):
         super().__init__()
         self.ln_q = nn.LayerNorm(d_model)
-        if bipartite:
+        if tp:
+            self.q = TensorProductChannelSublayer(vocab_size, dims, Ws, d_model,
+                                                  factorize=factorize)
+        elif bipartite:
             self.q = BipartiteChannelSublayer(vocab_size, d1, d2, Wa, Wb, d_model,
                                               factorize=factorize)
         else:
@@ -358,7 +435,8 @@ class HybridLM(nn.Module):
     def __init__(self, vocab_size, n_layers=4, n=32, W=4, d_model=256,
                  n_heads=8, block_size=256, persist="fresh",
                  attn_kind="dot", n_q=16,
-                 bipartite=False, d1=0, d2=0, Wa=0, Wb=0, factorize=False):
+                 bipartite=False, d1=0, d2=0, Wa=0, Wb=0, factorize=False,
+                 tp=False, dims=None, Ws=None):
         super().__init__()
         self.vocab_size = vocab_size
         self.block_size = block_size
@@ -367,7 +445,8 @@ class HybridLM(nn.Module):
         self.pos_emb = nn.Parameter(torch.zeros(1, block_size, d_model))
         self.blocks = nn.ModuleList(
             [Block(vocab_size, n, W, d_model, n_heads, attn_kind=attn_kind, n_q=n_q,
-                   bipartite=bipartite, d1=d1, d2=d2, Wa=Wa, Wb=Wb, factorize=factorize)
+                   bipartite=bipartite, d1=d1, d2=d2, Wa=Wa, Wb=Wb, factorize=factorize,
+                   tp=tp, dims=dims, Ws=Ws)
              for _ in range(n_layers)])
         self.ln_f = nn.LayerNorm(d_model)
         self.head = nn.Linear(d_model, vocab_size, bias=False)

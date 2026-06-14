@@ -60,6 +60,15 @@ def main():
     ap.add_argument("--factorize", action="store_true",
                     help="bipartite: use PRODUCT Kraus (cannot entangle). Omit for "
                          "the ENTANGLING (general Kraus) config.")
+    ap.add_argument("--tp", action="store_true",
+                    help="rung 4 scaling: k-factor tensor-product state on "
+                         "(x)_i C^dims[i]. Sweep --dims to vary the number of factors "
+                         "at fixed n and watch whether the entangling-vs-product gap "
+                         "and the negativity GROW with k. Use with/without --factorize.")
+    ap.add_argument("--dims", default="8,8",
+                    help="tp: comma-separated factor dims, e.g. '64' '8,8' '4,4,4'")
+    ap.add_argument("--Ws", default="2,2",
+                    help="tp: comma-separated per-factor Kraus counts, e.g. '2,2,2'")
     ap.add_argument("--n_layers", type=int, default=4)
     ap.add_argument("--n", type=int, default=32, help="Hilbert dim per quantum sublayer")
     ap.add_argument("--kraus", type=int, default=4)
@@ -90,7 +99,14 @@ def main():
     train_ds = CharDataset(text, tok, block_size=args.block, split="train", seed=args.seed)
     val_ds = CharDataset(text, tok, block_size=args.block, split="val", seed=args.seed + 1)
 
-    if args.bipartite:
+    if args.tp:
+        dims = [int(x) for x in args.dims.split(",")]
+        Ws = [int(x) for x in args.Ws.split(",")]
+        model = HybridLM(tok.vocab_size, n_layers=args.n_layers, d_model=args.d_model,
+                         n_heads=args.n_heads, block_size=args.block, persist=args.persist,
+                         attn_kind=args.attn, n_q=args.n_q,
+                         tp=True, dims=dims, Ws=Ws, factorize=args.factorize).to(dev)
+    elif args.bipartite:
         model = HybridLM(tok.vocab_size, n_layers=args.n_layers, d_model=args.d_model,
                          n_heads=args.n_heads, block_size=args.block, persist=args.persist,
                          attn_kind=args.attn, n_q=args.n_q,
@@ -142,18 +158,25 @@ def main():
 
     # ── coherence probe: continue the prompt, watch for on-topic structure ──
     model.eval()
-    if args.bipartite:
-        # measure entanglement actually used: mean negativity of layer-0 final rho
-        from qlm.hybrid import negativity, BipartiteChannelSublayer
+    if args.tp or args.bipartite:
         seqs = val_ds.sample_batch(args.batch).to(dev)
         with torch.no_grad():
             blk0 = model.blocks[0].q
             _, rho = blk0(seqs[:, :-1])
-            neg = negativity(rho.real, rho.imag, args.d1, args.d2)
+            if args.tp:
+                from qlm.hybrid import mean_negativity
+                dims = [int(x) for x in args.dims.split(",")]
+                neg = mean_negativity(rho.real, rho.imag, dims)
+                k = len(dims)
+            else:
+                from qlm.hybrid import negativity
+                neg = negativity(rho.real, rho.imag, args.d1, args.d2)
+                k = 2
         cfg = "PRODUCT (cannot entangle)" if args.factorize else "ENTANGLING (general)"
-        print(f"\n[entanglement] config={cfg} | negativity mean={neg.mean().item():.4f} "
-              f"max={neg.max().item():.4f}")
-        print(f"   (product config should be ~0; entangling >0 IFF the model learned to use it)")
+        print(f"\n[entanglement] config={cfg} | k={k} factors | "
+              f"mean negativity={neg.mean().item():.4f} max={neg.max().item():.4f}")
+        print(f"   (product config should be ~0; entangling >0 IFF the model uses it; "
+              f"the SCALING test is whether this GROWS with k)")
     ids = torch.tensor([tok.encode(args.prompt)], device=dev)
     out = model.generate(ids, n_new=300, temperature=0.7, top_k=20,
                          decohere=args.decohere)
