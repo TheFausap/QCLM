@@ -42,6 +42,14 @@ def main():
     ap.add_argument("--batch", type=int, default=64)
     ap.add_argument("--steps", type=int, default=2000)
     ap.add_argument("--lr", type=float, default=3e-4)
+    ap.add_argument("--dropout", type=float, default=0.1,
+                    help="dropout on attention, MLP, memory readout, embeddings. "
+                         "The lossless memory has high capacity and overfits small "
+                         "corpora; 0.1-0.2 helps on tiny-shakespeare.")
+    ap.add_argument("--wd", type=float, default=0.1, help="AdamW weight decay")
+    ap.add_argument("--out", default=os.path.join(HERE, "artifacts"),
+                    help="dir for best-VAL checkpoint")
+    ap.add_argument("--tag", default="uhybrid")
     ap.add_argument("--warmup", type=int, default=150)
     ap.add_argument("--eval_every", type=int, default=250)
     ap.add_argument("--decohere", action="store_true")
@@ -60,10 +68,14 @@ def main():
 
     model = UnitaryMemoryHybridLM(tok.vocab_size, n_layers=args.n_layers,
                                   mem_dim=args.mem_dim, d_model=args.d_model,
-                                  n_heads=args.n_heads, block_size=args.block).to(dev)
+                                  n_heads=args.n_heads, block_size=args.block,
+                                  dropout=args.dropout).to(dev)
     print(f"device {dev} | mem_dim={args.mem_dim} | params {model.num_params()/1e6:.2f}M "
-          f"| decohere={args.decohere}")
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95))
+          f"| dropout={args.dropout} wd={args.wd} | decohere={args.decohere}")
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95),
+                            weight_decay=args.wd)
+    os.makedirs(args.out, exist_ok=True)
+    best_val = float("inf")
 
     def lr_at(s):
         if s < args.warmup:
@@ -89,7 +101,15 @@ def main():
                   f"gnorm {gn:.2f} | {sp:.0f} tok/s")
         if (step + 1) % args.eval_every == 0 or step == args.steps - 1:
             vb = evaluate(model, val_ds, args.batch, 10, dev, args.decohere)
-            print(f"   >>> step {step+1}: VAL {vb:.3f} bits/char")
+            flag = ""
+            if vb < best_val:
+                best_val = vb
+                tag = f"{args.tag}_{'dec' if args.decohere else 'int'}"
+                torch.save({"model": model.state_dict(), "val_bits": vb,
+                            "step": step + 1, "args": vars(args)},
+                           os.path.join(args.out, f"{tag}_best.pt"))
+                flag = " *best (checkpointed)"
+            print(f"   >>> step {step+1}: VAL {vb:.3f} bits/char{flag}")
 
     model.eval()
     ids = torch.tensor([tok.encode(args.prompt)], device=dev)

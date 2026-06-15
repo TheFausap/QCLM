@@ -96,12 +96,14 @@ class UnitaryMemory(nn.Module):
 
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, d_model, n_heads):
+    def __init__(self, d_model, n_heads, dropout=0.0):
         super().__init__()
         assert d_model % n_heads == 0
         self.h = n_heads
         self.qkv = nn.Linear(d_model, 3 * d_model)
         self.proj = nn.Linear(d_model, d_model)
+        self.attn_dropout = dropout
+        self.resid_drop = nn.Dropout(dropout)
 
     def forward(self, x):
         B, L, D = x.shape
@@ -109,9 +111,10 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, L, self.h, D // self.h).transpose(1, 2)
         k = k.view(B, L, self.h, D // self.h).transpose(1, 2)
         v = v.view(B, L, self.h, D // self.h).transpose(1, 2)
-        y = _sdpa(q, k, v, is_causal=True, dropout_p=0.0)
+        y = _sdpa(q, k, v, is_causal=True,
+                  dropout_p=self.attn_dropout if self.training else 0.0)
         y = y.transpose(1, 2).contiguous().view(B, L, D)
-        return self.proj(y)
+        return self.resid_drop(self.proj(y))
 
 
 class Block(nn.Module):
@@ -123,33 +126,35 @@ class Block(nn.Module):
     track itself is computed ONCE and shared (lossless, never collapsed).
     """
 
-    def __init__(self, d_model, n_heads, mem_dim):
+    def __init__(self, d_model, n_heads, mem_dim, dropout=0.0):
         super().__init__()
         self.mem_proj = nn.Linear(2 * mem_dim, d_model)
+        self.mem_drop = nn.Dropout(dropout)        # memory is the overfitting vector
         self.ln_a = nn.LayerNorm(d_model)
-        self.attn = CausalSelfAttention(d_model, n_heads)
+        self.attn = CausalSelfAttention(d_model, n_heads, dropout=dropout)
         self.ln_m = nn.LayerNorm(d_model)
         self.mlp = nn.Sequential(nn.Linear(d_model, 4 * d_model), nn.GELU(),
-                                 nn.Linear(4 * d_model, d_model))
+                                 nn.Linear(4 * d_model, d_model), nn.Dropout(dropout))
 
     def forward(self, x, mem_feats):
-        x = x + self.mem_proj(mem_feats)       # lossless quantum recall injection
-        x = x + self.attn(self.ln_a(x))        # nonlinear all-to-all routing
+        x = x + self.mem_drop(self.mem_proj(mem_feats))  # lossless quantum recall injection
+        x = x + self.attn(self.ln_a(x))                  # nonlinear all-to-all routing
         x = x + self.mlp(self.ln_m(x))
         return x
 
 
 class UnitaryMemoryHybridLM(nn.Module):
     def __init__(self, vocab_size, n_layers=6, mem_dim=128, d_model=384,
-                 n_heads=6, block_size=256):
+                 n_heads=6, block_size=256, dropout=0.0):
         super().__init__()
         self.vocab_size = vocab_size
         self.block_size = block_size
         self.tok_emb = nn.Embedding(vocab_size, d_model)
         self.pos_emb = nn.Parameter(torch.zeros(1, block_size, d_model))
+        self.emb_drop = nn.Dropout(dropout)
         self.memory = UnitaryMemory(vocab_size, mem_dim)   # ONE lossless track
         self.blocks = nn.ModuleList(
-            [Block(d_model, n_heads, mem_dim) for _ in range(n_layers)])
+            [Block(d_model, n_heads, mem_dim, dropout=dropout) for _ in range(n_layers)])
         self.ln_f = nn.LayerNorm(d_model)
         self.head = nn.Linear(d_model, vocab_size, bias=False)
         self.head.weight = self.tok_emb.weight
@@ -169,6 +174,7 @@ class UnitaryMemoryHybridLM(nn.Module):
     def forward(self, idx, targets=None, decohere=False):
         B, L = idx.shape
         x = self.tok_emb(idx) + self.pos_emb[:, :L]
+        x = self.emb_drop(x)
         mem_feats = self.memory(idx, decohere=decohere)   # (B,L,2*mem_dim), lossless
         for blk in self.blocks:
             x = blk(x, mem_feats)
