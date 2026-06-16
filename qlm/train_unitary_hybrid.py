@@ -53,6 +53,11 @@ def main():
     ap.add_argument("--warmup", type=int, default=150)
     ap.add_argument("--eval_every", type=int, default=250)
     ap.add_argument("--decohere", action="store_true")
+    ap.add_argument("--complex_embed", action="store_true",
+                    help="quantum-native input: learned amplitude+phase token "
+                         "embedding (phase first-class in the data). Tests whether "
+                         "the classical real-lookup embedding was starving the "
+                         "quantum mechanism. --decohere zeros the embedding phase.")
     ap.add_argument("--device", default="auto")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--prompt", default="ROMEO:")
@@ -69,9 +74,11 @@ def main():
     model = UnitaryMemoryHybridLM(tok.vocab_size, n_layers=args.n_layers,
                                   mem_dim=args.mem_dim, d_model=args.d_model,
                                   n_heads=args.n_heads, block_size=args.block,
-                                  dropout=args.dropout).to(dev)
+                                  dropout=args.dropout,
+                                  complex_embed=args.complex_embed).to(dev)
     print(f"device {dev} | mem_dim={args.mem_dim} | params {model.num_params()/1e6:.2f}M "
-          f"| dropout={args.dropout} wd={args.wd} | decohere={args.decohere}")
+          f"| dropout={args.dropout} wd={args.wd} | complex_embed={args.complex_embed} "
+          f"| decohere={args.decohere}")
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95),
                             weight_decay=args.wd)
     os.makedirs(args.out, exist_ok=True)

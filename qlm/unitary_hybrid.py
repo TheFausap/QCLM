@@ -145,19 +145,33 @@ class Block(nn.Module):
 
 class UnitaryMemoryHybridLM(nn.Module):
     def __init__(self, vocab_size, n_layers=6, mem_dim=128, d_model=384,
-                 n_heads=6, block_size=256, dropout=0.0):
+                 n_heads=6, block_size=256, dropout=0.0, complex_embed=False):
         super().__init__()
         self.vocab_size = vocab_size
         self.block_size = block_size
-        self.tok_emb = nn.Embedding(vocab_size, d_model)
+        self.complex_embed = complex_embed
+        if complex_embed:
+            # Quantum-native input: each token -> a learned state in C^{d_model/2},
+            # parametrised as amplitude * exp(i*phase). Phase is a FIRST-CLASS
+            # learned property of the data, not synthesised by the channel. The
+            # complex state enters the (real) residual stream as [Re, Im], so the
+            # phase is carried into the model natively. decohere zeros the phase.
+            assert d_model % 2 == 0
+            self.ce = d_model // 2
+            self.emb_amp = nn.Parameter(torch.randn(vocab_size, self.ce) * 0.02)
+            self.emb_phase = nn.Parameter(torch.randn(vocab_size, self.ce) * 0.5)
+            # untied real head (weight tying doesn't apply to a complex embedding)
+            self.head = nn.Linear(d_model, vocab_size, bias=False)
+        else:
+            self.tok_emb = nn.Embedding(vocab_size, d_model)
+            self.head = nn.Linear(d_model, vocab_size, bias=False)
+            self.head.weight = self.tok_emb.weight
         self.pos_emb = nn.Parameter(torch.zeros(1, block_size, d_model))
         self.emb_drop = nn.Dropout(dropout)
         self.memory = UnitaryMemory(vocab_size, mem_dim)   # ONE lossless track
         self.blocks = nn.ModuleList(
             [Block(d_model, n_heads, mem_dim, dropout=dropout) for _ in range(n_layers)])
         self.ln_f = nn.LayerNorm(d_model)
-        self.head = nn.Linear(d_model, vocab_size, bias=False)
-        self.head.weight = self.tok_emb.weight
         self.apply(self._init)
         for nm, p in self.named_parameters():
             if nm.endswith("proj.weight") or nm.endswith("mlp.2.weight"):
@@ -171,9 +185,17 @@ class UnitaryMemoryHybridLM(nn.Module):
         elif isinstance(m, nn.Embedding):
             torch.nn.init.normal_(m.weight, 0.0, 0.02)
 
+    def _embed(self, idx, decohere=False):
+        if not self.complex_embed:
+            return self.tok_emb(idx)
+        amp = self.emb_amp[idx]                              # (B,L,ce)
+        phase = torch.zeros_like(self.emb_phase[idx]) if decohere else self.emb_phase[idx]
+        # complex state -> [Re, Im] into the real residual stream (phase native)
+        return torch.cat([amp * torch.cos(phase), amp * torch.sin(phase)], dim=-1)
+
     def forward(self, idx, targets=None, decohere=False):
         B, L = idx.shape
-        x = self.tok_emb(idx) + self.pos_emb[:, :L]
+        x = self._embed(idx, decohere=decohere) + self.pos_emb[:, :L]
         x = self.emb_drop(x)
         mem_feats = self.memory(idx, decohere=decohere)   # (B,L,2*mem_dim), lossless
         for blk in self.blocks:
