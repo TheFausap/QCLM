@@ -94,6 +94,31 @@ class UnitaryMemory(nn.Module):
                 feats.append(torch.cat([psi.real, psi.imag], -1))  # phase-carrying
         return torch.stack(feats, 1)                   # (B,L,2n)
 
+    @torch.no_grad()
+    def state_trajectory(self, x, decohere=False):
+        """Return the raw complex memory state psi_t (B,L,n) along a sequence,
+        for OTOC/mutual-information diagnostics. With decohere=True the phase is
+        zeroed each step (state kept real, |amplitude| preserved), mirroring the
+        readout ablation so the diagnostic can quantify the quantum correlation
+        the phase carries -- the principled version of the decohere ablation
+        (cf. Singh et al., Academia Quantum 2026, Sec. 3.2: Im[OTOC] ~ correlation).
+        """
+        B, L = x.shape
+        A = torch.complex(self.Ar, self.Ai)
+        U = cayley_unitary(A)
+        Useq = U[x]
+        psi = torch.complex(self.psi0_r, self.psi0_i)
+        psi = (psi / psi.norm()).unsqueeze(0).expand(B, -1).contiguous()
+        traj = []
+        for t in range(L):
+            psi = torch.einsum('bij,bj->bi', Useq[:, t], psi)
+            psi = psi / (psi.norm(dim=-1, keepdim=True) + 1e-8)
+            if decohere:
+                # zero phase: keep amplitudes real (collapses quantum correlation)
+                psi = torch.complex(psi.abs(), torch.zeros_like(psi.real))
+                psi = psi / (psi.norm(dim=-1, keepdim=True) + 1e-8)
+            traj.append(psi.clone())
+        return torch.stack(traj, 1)                     # (B,L,n) complex
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, d_model, n_heads, dropout=0.0):
